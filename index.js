@@ -8,7 +8,7 @@ const { Server } = require('socket.io');
 
 dotenv.config({ path: path.resolve(__dirname, '..', '.env') });
 
-const PORT = process.env.CHAT_SERVER_PORT || 3001;
+const PORT = process.env.PORT || process.env.CHAT_SERVER_PORT || 3001;
 const MONGODB_URI = process.env.MONGODB_URI;
 const MONGODB_DB = process.env.MONGODB_DB || 'puja_chat';
 const CLIENT_ORIGIN = process.env.CHAT_CLIENT_ORIGIN || '*';
@@ -109,6 +109,10 @@ async function main() {
 
   app.use(cors());
   app.use(express.json());
+
+  app.get('/', (_req, res) => {
+    res.json({ ok: true, service: 'puja-app-chat-server' });
+  });
 
   app.get('/health', (_req, res) => {
     res.json({ ok: true });
