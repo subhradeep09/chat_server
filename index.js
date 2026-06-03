@@ -198,6 +198,21 @@ async function main() {
     }
   });
 
+  // ── REST: DEBUG — check if a token exists for a userId ─────────────────────
+  // Visit: GET /push-token/:userId to verify token saved in MongoDB
+  app.get('/push-token/:userId', async (req, res) => {
+    try {
+      const token = await getPushToken(req.params.userId);
+      if (token) {
+        res.json({ ok: true, hasToken: true, token });
+      } else {
+        res.json({ ok: true, hasToken: false, token: null });
+      }
+    } catch (err) {
+      res.status(500).json({ error: 'Failed to check push token' });
+    }
+  });
+
   // ── REST: load messages ──────────────────────────────────────────────────────
   app.get('/messages', async (req, res) => {
     try {
