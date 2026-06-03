@@ -228,19 +228,19 @@ async function main() {
   app.get('/health', (_req, res) => res.json({ ok: true }));
 
   // ── REST: register / update push token ──────────────────────────────────────
-  // Called by the app on every login. Upserts into MongoDB notifytoken collection.
-  // Persists across server restarts — no RAM dependency.
+  // Accepts raw FCM device tokens (from getDevicePushTokenAsync on Android).
+  // Upserts into MongoDB notifytoken collection.
   app.post('/push-token', async (req, res) => {
     try {
       const { userId, token } = req.body || {};
       if (!userId || !token) {
         return res.status(400).json({ error: 'userId and token are required' });
       }
-      if (!Expo.isExpoPushToken(token)) {
-        return res.status(400).json({ error: 'Invalid Expo push token format' });
+      if (typeof token !== 'string' || token.length < 10) {
+        return res.status(400).json({ error: 'Invalid token format' });
       }
       await savePushToken(userId, token);
-      console.log(`[push-token] Saved to MongoDB for userId=${userId}`);
+      console.log(`[push-token] Saved to MongoDB for userId=${userId}, token=${token.slice(0, 20)}...`);
       res.json({ ok: true });
     } catch (err) {
       console.error('[push-token] POST error:', err);
