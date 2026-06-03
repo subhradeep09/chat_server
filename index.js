@@ -525,18 +525,22 @@ async function main() {
         // Deliver to everyone in the chat room
         io.to(roomId).emit('message:new', message);
 
-        // Also push to receiver's background socket (HomeScreen) if they're registered
-        const receiverMeta = userPresence.get(receiverId);
-        if (receiverMeta?.socketId && receiverMeta.socketId !== socket.id) {
-          const receiverSocket = io.sockets.sockets.get(receiverMeta.socketId);
-          if (receiverSocket && !receiverSocket.rooms.has(roomId)) {
-            // Push to their background socket (shows in-app toast on HomeScreen)
-            receiverSocket.emit('message:new', message);
+        // ── In-app toast: find receiver's background socket and emit directly ──
+        // We search socketMeta (not userPresence) because userPresence may have
+        // a stale/disconnected chat socket ID if the user left a chat room.
+        for (const [sid, meta] of socketMeta.entries()) {
+          if (meta.userId === receiverId && meta.mode === 'background') {
+            const bgSock = io.sockets.sockets.get(sid);
+            if (bgSock) {
+              bgSock.emit('message:new', message);
+              console.log(`[toast] Sent message:new to background socket of userId=${receiverId}`);
+            }
           }
         }
 
         // ── Send FCM push notification (mobile system tray) via firebase-admin ─────
         // Only send if receiver is NOT currently active in this chat room.
+        const receiverMeta = userPresence.get(receiverId);
         const receiverInRoom = receiverMeta?.chatId === roomId && receiverMeta?.isActive;
         if (!receiverInRoom) {
           const fcmToken = await getPushToken(receiverId);
