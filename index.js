@@ -14,29 +14,32 @@ const MONGODB_URI  = process.env.MONGODB_URI;
 const MONGODB_DB   = process.env.MONGODB_DB || 'puja_chat';
 const CLIENT_ORIGIN = process.env.CHAT_CLIENT_ORIGIN || '*';
 
-// ─── Firebase Admin (FCM) setup ─────────────────────────────────────────────────────
-// The service account JSON is placed in the server folder.
-// Download from: Firebase Console → Project Settings → Service Accounts → Generate new private key
-const SERVICE_ACCOUNT_PATH = process.env.FIREBASE_SERVICE_ACCOUNT_PATH ||
-  path.resolve(__dirname, 'serviceAccountKey.json');
-
+// ─── Firebase Admin (FCM) setup ───────────────────────────────────────────────
+// On Render: set FIREBASE_SERVICE_ACCOUNT_JSON env var with the full JSON string
+// Locally:   place serviceAccountKey.json in the server/ folder
 let firebaseApp = null;
 try {
-  const serviceAccount = require(SERVICE_ACCOUNT_PATH);
-  firebaseApp = admin.initializeApp({
-    credential: admin.credential.cert(serviceAccount),
-  });
+  let serviceAccount;
+  if (process.env.FIREBASE_SERVICE_ACCOUNT_JSON) {
+    // Render / production: read credentials from environment variable
+    serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_JSON);
+    console.log('[FCM] Using service account from FIREBASE_SERVICE_ACCOUNT_JSON env var');
+  } else {
+    // Local dev: read from file
+    serviceAccount = require(path.resolve(__dirname, 'serviceAccountKey.json'));
+    console.log('[FCM] Using service account from serviceAccountKey.json file');
+  }
+  firebaseApp = admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
   console.log('[FCM] Firebase Admin initialized ✅');
 } catch (e) {
-  console.error('[FCM] ❌ Firebase Admin NOT initialized — place serviceAccountKey.json in server folder:', e.message);
+  console.error('[FCM] ❌ Firebase Admin NOT initialized:', e.message);
+  console.error('[FCM]    → On Render: add FIREBASE_SERVICE_ACCOUNT_JSON environment variable');
+  console.error('[FCM]    → Locally: place serviceAccountKey.json in the server/ folder');
 }
 
 /**
- * Send a push notification directly via Firebase Cloud Messaging.
- * @param {string} fcmToken  — raw FCM registration token (from getDevicePushTokenAsync)
- * @param {string} title
- * @param {string} body
- * @param {object} data      — extra key→value payload delivered to app
+ * Send FCM push notification directly via firebase-admin (no Expo intermediary).
+ * fcmToken = raw device token from Notifications.getDevicePushTokenAsync() on Android.
  */
 async function sendFCMNotification(fcmToken, title, body, data = {}) {
   if (!firebaseApp) {
@@ -44,10 +47,11 @@ async function sendFCMNotification(fcmToken, title, body, data = {}) {
     return;
   }
   if (!fcmToken) {
-    console.warn('[FCM] Skipping push — no FCM token for user');
+    console.warn('[FCM] Skipping push — no FCM token for this user');
     return;
   }
   try {
+    // FCM data values must all be strings
     const stringData = {};
     for (const [k, v] of Object.entries(data)) stringData[k] = String(v);
 
@@ -64,15 +68,15 @@ async function sendFCMNotification(fcmToken, title, body, data = {}) {
         },
       },
     });
-    console.log('[FCM] ✅ Notification sent, messageId:', result);
+    console.log('[FCM] ✅ Notification sent:', result);
   } catch (err) {
-    console.error('[FCM] ❌ Failed to send notification:', err.message);
-    // If token is no longer valid, you can delete it here
+    console.error('[FCM] ❌ Send failed:', err.message);
     if (err.code === 'messaging/registration-token-not-registered') {
-      console.warn('[FCM] Token no longer valid — consider deleting from DB');
+      console.warn('[FCM] Token expired — user needs to reopen app to refresh');
     }
   }
 }
+
 
 if (!MONGODB_URI) {
   console.error('Missing MONGODB_URI in .env');
