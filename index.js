@@ -5,6 +5,7 @@ const cors = require('cors');
 const dotenv = require('dotenv');
 const mongoose = require('mongoose');
 const { Server } = require('socket.io');
+const { Expo } = require('expo-server-sdk');
 
 dotenv.config({ path: path.resolve(__dirname, '..', '.env') });
 
@@ -80,6 +81,15 @@ const userPresence = new Map();
 // mode: 'chat' (in a specific chat) | 'background' (global listener on HomeScreen)
 const socketMeta = new Map();
 
+// ─── In-memory push token store ───────────────────────────────────────────────
+// Stored in RAM only — no DB needed.
+// Key: userId (string), Value: Expo push token (string)
+// Token is sent by the app on every login/socket connect.
+const userPushTokens = new Map();
+
+// Expo push client — used to send push notifications
+const expo = new Expo();
+
 function setUserOnline(userId, socketId, chatId, userName) {
   userPresence.set(userId, {
     socketId,
@@ -122,6 +132,29 @@ async function main() {
 
   app.get('/',       (_req, res) => res.json({ ok: true, service: 'puja-app-chat-server' }));
   app.get('/health', (_req, res) => res.json({ ok: true }));
+
+  // ── REST: register / update push token ──────────────────────────────────────
+  // Called by the app on login to store the Expo push token in server RAM.
+  // No database — stored only for the current server session.
+  app.post('/push-token', (req, res) => {
+    const { userId, token } = req.body || {};
+    if (!userId || !token) {
+      return res.status(400).json({ error: 'userId and token are required' });
+    }
+    if (!Expo.isExpoPushToken(token)) {
+      return res.status(400).json({ error: 'Invalid Expo push token format' });
+    }
+    userPushTokens.set(userId, token);
+    console.log(`[push-token] Registered token for userId=${userId}`);
+    res.json({ ok: true });
+  });
+
+  // ── REST: clear push token (when user sees/clears notifications) ─────────────
+  app.delete('/push-token/:userId', (req, res) => {
+    userPushTokens.delete(req.params.userId);
+    console.log(`[push-token] Cleared token for userId=${req.params.userId}`);
+    res.json({ ok: true });
+  });
 
   // ── REST: load messages ──────────────────────────────────────────────────────
   app.get('/messages', async (req, res) => {
@@ -377,8 +410,40 @@ async function main() {
         if (receiverMeta?.socketId && receiverMeta.socketId !== socket.id) {
           const receiverSocket = io.sockets.sockets.get(receiverMeta.socketId);
           if (receiverSocket && !receiverSocket.rooms.has(roomId)) {
-            // Only push if they're not already in the chat room (would be duplicate)
+            // Push to their background socket (shows in-app toast on HomeScreen)
             receiverSocket.emit('message:new', message);
+          }
+        }
+
+        // ── Send Expo push notification (mobile system tray) ──────────────────
+        // Only send if the receiver is NOT currently active in this chat room
+        const receiverInRoom = receiverMeta?.chatId === roomId && receiverMeta?.isActive;
+        if (!receiverInRoom) {
+          const pushToken = userPushTokens.get(receiverId);
+          if (pushToken && Expo.isExpoPushToken(pushToken)) {
+            try {
+              const pushMessages = [{
+                to:    pushToken,
+                sound: 'default',
+                title: senderName || 'New message',
+                body:  text.length > 100 ? text.slice(0, 97) + '…' : text,
+                data:  {
+                  otherUserId: senderId,
+                  senderName:  senderName || 'Someone',
+                  chatId:      roomId,
+                },
+                channelId: 'chat',
+                badge: 1,
+              }];
+
+              const chunks = expo.chunkPushNotifications(pushMessages);
+              for (const chunk of chunks) {
+                const tickets = await expo.sendPushNotificationsAsync(chunk);
+                console.log(`[push] Sent to userId=${receiverId}`, tickets);
+              }
+            } catch (pushErr) {
+              console.error('[push] Failed to send push notification:', pushErr);
+            }
           }
         }
 
