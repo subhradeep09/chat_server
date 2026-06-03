@@ -5,7 +5,7 @@ const cors = require('cors');
 const dotenv = require('dotenv');
 const mongoose = require('mongoose');
 const { Server } = require('socket.io');
-const { Expo } = require('expo-server-sdk');
+const admin = require('firebase-admin');
 
 dotenv.config({ path: path.resolve(__dirname, '..', '.env') });
 
@@ -13,6 +13,66 @@ const PORT         = process.env.PORT || process.env.CHAT_SERVER_PORT || 3001;
 const MONGODB_URI  = process.env.MONGODB_URI;
 const MONGODB_DB   = process.env.MONGODB_DB || 'puja_chat';
 const CLIENT_ORIGIN = process.env.CHAT_CLIENT_ORIGIN || '*';
+
+// ─── Firebase Admin (FCM) setup ─────────────────────────────────────────────────────
+// The service account JSON is placed in the server folder.
+// Download from: Firebase Console → Project Settings → Service Accounts → Generate new private key
+const SERVICE_ACCOUNT_PATH = process.env.FIREBASE_SERVICE_ACCOUNT_PATH ||
+  path.resolve(__dirname, 'serviceAccountKey.json');
+
+let firebaseApp = null;
+try {
+  const serviceAccount = require(SERVICE_ACCOUNT_PATH);
+  firebaseApp = admin.initializeApp({
+    credential: admin.credential.cert(serviceAccount),
+  });
+  console.log('[FCM] Firebase Admin initialized ✅');
+} catch (e) {
+  console.error('[FCM] ❌ Firebase Admin NOT initialized — place serviceAccountKey.json in server folder:', e.message);
+}
+
+/**
+ * Send a push notification directly via Firebase Cloud Messaging.
+ * @param {string} fcmToken  — raw FCM registration token (from getDevicePushTokenAsync)
+ * @param {string} title
+ * @param {string} body
+ * @param {object} data      — extra key→value payload delivered to app
+ */
+async function sendFCMNotification(fcmToken, title, body, data = {}) {
+  if (!firebaseApp) {
+    console.warn('[FCM] Skipping push — firebase-admin not initialized');
+    return;
+  }
+  if (!fcmToken) {
+    console.warn('[FCM] Skipping push — no FCM token for user');
+    return;
+  }
+  try {
+    const stringData = {};
+    for (const [k, v] of Object.entries(data)) stringData[k] = String(v);
+
+    const result = await admin.messaging().send({
+      token: fcmToken,
+      notification: { title, body },
+      data: stringData,
+      android: {
+        priority: 'high',
+        notification: {
+          channelId: 'chat',
+          sound: 'default',
+          defaultVibrateTimings: true,
+        },
+      },
+    });
+    console.log('[FCM] ✅ Notification sent, messageId:', result);
+  } catch (err) {
+    console.error('[FCM] ❌ Failed to send notification:', err.message);
+    // If token is no longer valid, you can delete it here
+    if (err.code === 'messaging/registration-token-not-registered') {
+      console.warn('[FCM] Token no longer valid — consider deleting from DB');
+    }
+  }
+}
 
 if (!MONGODB_URI) {
   console.error('Missing MONGODB_URI in .env');
@@ -118,8 +178,7 @@ const userPresence = new Map();
 // mode: 'chat' (in a specific chat) | 'background' (global listener on HomeScreen)
 const socketMeta = new Map();
 
-// Expo push client — used to send push notifications via Expo's API
-const expo = new Expo();
+
 
 function setUserOnline(userId, socketId, chatId, userName) {
   userPresence.set(userId, {
@@ -472,37 +531,17 @@ async function main() {
           }
         }
 
-        // ── Send Expo push notification (mobile system tray) ──────────────────
-        // Only send if the receiver is NOT currently active in this chat room.
-        // Token is fetched from MongoDB notifytoken collection (persists across restarts).
+        // ── Send FCM push notification (mobile system tray) via firebase-admin ─────
+        // Only send if receiver is NOT currently active in this chat room.
         const receiverInRoom = receiverMeta?.chatId === roomId && receiverMeta?.isActive;
         if (!receiverInRoom) {
-          try {
-            const pushToken = await getPushToken(receiverId);
-            if (pushToken && Expo.isExpoPushToken(pushToken)) {
-              const pushMessages = [{
-                to:    pushToken,
-                sound: 'default',
-                title: senderName || 'New message',
-                body:  text.length > 100 ? text.slice(0, 97) + '…' : text,
-                data:  {
-                  otherUserId: senderId,
-                  senderName:  senderName || 'Someone',
-                  chatId:      roomId,
-                },
-                channelId: 'chat',
-                badge: 1,
-              }];
-
-              const chunks = expo.chunkPushNotifications(pushMessages);
-              for (const chunk of chunks) {
-                const tickets = await expo.sendPushNotificationsAsync(chunk);
-                console.log(`[push] Sent to userId=${receiverId}`, tickets);
-              }
-            }
-          } catch (pushErr) {
-            console.error('[push] Failed to send push notification:', pushErr);
-          }
+          const fcmToken = await getPushToken(receiverId);
+          await sendFCMNotification(
+            fcmToken,
+            senderName || 'New message',
+            text.length > 100 ? text.slice(0, 97) + '…' : text,
+            { otherUserId: senderId, senderName: senderName || 'Someone', chatId: roomId }
+          );
         }
 
         if (typeof ack === 'function') ack({ ok: true, message });
