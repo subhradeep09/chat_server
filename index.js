@@ -24,7 +24,9 @@ if (/atlas-sql|\.query\.mongodb\.net/i.test(MONGODB_URI)) {
   process.exit(1);
 }
 
-// ─── Mongoose schema ──────────────────────────────────────────────────────────
+// ─── Mongoose schemas ─────────────────────────────────────────────────────────
+
+// ── messages collection ──
 const messageSchema = new mongoose.Schema(
   {
     chatId:          { type: String, required: true, index: true },
@@ -40,6 +42,41 @@ const messageSchema = new mongoose.Schema(
 );
 messageSchema.index({ chatId: 1, createdAt: 1 });
 const Message = mongoose.model('Message', messageSchema);
+
+// ── notifytoken collection ──
+// Stores Expo push tokens permanently in MongoDB (collection: notifytoken).
+// One document per user — upserted on every app login.
+// Survives server restarts unlike the old in-memory Map.
+const notifyTokenSchema = new mongoose.Schema(
+  {
+    userId: { type: String, required: true, unique: true, index: true },
+    token:  { type: String, required: true },
+  },
+  { timestamps: { createdAt: true, updatedAt: true }, versionKey: false, collection: 'notifytoken' }
+);
+const NotifyToken = mongoose.model('NotifyToken', notifyTokenSchema);
+
+// ── notifytoken helpers ──
+
+/** Save (upsert) a push token for a user — called when app registers */
+async function savePushToken(userId, token) {
+  await NotifyToken.findOneAndUpdate(
+    { userId },
+    { userId, token },
+    { upsert: true, new: true, setDefaultsOnInsert: true }
+  );
+}
+
+/** Get the push token for a user — called before sending a notification */
+async function getPushToken(userId) {
+  const doc = await NotifyToken.findOne({ userId }).lean();
+  return doc ? doc.token : null;
+}
+
+/** Delete the push token for a user — called when user clears notifications */
+async function deletePushToken(userId) {
+  await NotifyToken.deleteOne({ userId });
+}
 
 function serializeMessage(msg) {
   return {
@@ -81,13 +118,7 @@ const userPresence = new Map();
 // mode: 'chat' (in a specific chat) | 'background' (global listener on HomeScreen)
 const socketMeta = new Map();
 
-// ─── In-memory push token store ───────────────────────────────────────────────
-// Stored in RAM only — no DB needed.
-// Key: userId (string), Value: Expo push token (string)
-// Token is sent by the app on every login/socket connect.
-const userPushTokens = new Map();
-
-// Expo push client — used to send push notifications
+// Expo push client — used to send push notifications via Expo's API
 const expo = new Expo();
 
 function setUserOnline(userId, socketId, chatId, userName) {
@@ -134,26 +165,37 @@ async function main() {
   app.get('/health', (_req, res) => res.json({ ok: true }));
 
   // ── REST: register / update push token ──────────────────────────────────────
-  // Called by the app on login to store the Expo push token in server RAM.
-  // No database — stored only for the current server session.
-  app.post('/push-token', (req, res) => {
-    const { userId, token } = req.body || {};
-    if (!userId || !token) {
-      return res.status(400).json({ error: 'userId and token are required' });
+  // Called by the app on every login. Upserts into MongoDB notifytoken collection.
+  // Persists across server restarts — no RAM dependency.
+  app.post('/push-token', async (req, res) => {
+    try {
+      const { userId, token } = req.body || {};
+      if (!userId || !token) {
+        return res.status(400).json({ error: 'userId and token are required' });
+      }
+      if (!Expo.isExpoPushToken(token)) {
+        return res.status(400).json({ error: 'Invalid Expo push token format' });
+      }
+      await savePushToken(userId, token);
+      console.log(`[push-token] Saved to MongoDB for userId=${userId}`);
+      res.json({ ok: true });
+    } catch (err) {
+      console.error('[push-token] POST error:', err);
+      res.status(500).json({ error: 'Failed to save push token' });
     }
-    if (!Expo.isExpoPushToken(token)) {
-      return res.status(400).json({ error: 'Invalid Expo push token format' });
-    }
-    userPushTokens.set(userId, token);
-    console.log(`[push-token] Registered token for userId=${userId}`);
-    res.json({ ok: true });
   });
 
   // ── REST: clear push token (when user sees/clears notifications) ─────────────
-  app.delete('/push-token/:userId', (req, res) => {
-    userPushTokens.delete(req.params.userId);
-    console.log(`[push-token] Cleared token for userId=${req.params.userId}`);
-    res.json({ ok: true });
+  // Removes the document from notifytoken collection in MongoDB.
+  app.delete('/push-token/:userId', async (req, res) => {
+    try {
+      await deletePushToken(req.params.userId);
+      console.log(`[push-token] Deleted from MongoDB for userId=${req.params.userId}`);
+      res.json({ ok: true });
+    } catch (err) {
+      console.error('[push-token] DELETE error:', err);
+      res.status(500).json({ error: 'Failed to delete push token' });
+    }
   });
 
   // ── REST: load messages ──────────────────────────────────────────────────────
@@ -416,12 +458,13 @@ async function main() {
         }
 
         // ── Send Expo push notification (mobile system tray) ──────────────────
-        // Only send if the receiver is NOT currently active in this chat room
+        // Only send if the receiver is NOT currently active in this chat room.
+        // Token is fetched from MongoDB notifytoken collection (persists across restarts).
         const receiverInRoom = receiverMeta?.chatId === roomId && receiverMeta?.isActive;
         if (!receiverInRoom) {
-          const pushToken = userPushTokens.get(receiverId);
-          if (pushToken && Expo.isExpoPushToken(pushToken)) {
-            try {
+          try {
+            const pushToken = await getPushToken(receiverId);
+            if (pushToken && Expo.isExpoPushToken(pushToken)) {
               const pushMessages = [{
                 to:    pushToken,
                 sound: 'default',
@@ -441,9 +484,9 @@ async function main() {
                 const tickets = await expo.sendPushNotificationsAsync(chunk);
                 console.log(`[push] Sent to userId=${receiverId}`, tickets);
               }
-            } catch (pushErr) {
-              console.error('[push] Failed to send push notification:', pushErr);
             }
+          } catch (pushErr) {
+            console.error('[push] Failed to send push notification:', pushErr);
           }
         }
 
