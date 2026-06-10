@@ -319,6 +319,21 @@ async function main() {
     }
   });
 
+  // ── REST: delete ALL messages for a chat (called when friends are removed) ──
+  // Permanently wipes the conversation from MongoDB so re-added friends start fresh.
+  app.delete('/messages', async (req, res) => {
+    try {
+      const chatId = String(req.query.chatId || '').trim();
+      if (!chatId) return res.status(400).json({ error: 'chatId is required' });
+      const result = await Message.deleteMany({ chatId });
+      console.log(`[messages] Deleted ${result.deletedCount} messages for chatId=${chatId}`);
+      res.json({ ok: true, deletedCount: result.deletedCount });
+    } catch (err) {
+      console.error('DELETE /messages error:', err);
+      res.status(500).json({ error: 'Unable to delete messages' });
+    }
+  });
+
   // ── REST: online status query ────────────────────────────────────────────────
   app.get('/presence/:userId', (req, res) => {
     const userId   = req.params.userId;
