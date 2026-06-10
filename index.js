@@ -334,6 +334,26 @@ async function main() {
     }
   });
 
+  // ── REST: mark all messages in a chat as read for a reader ───────────────────
+  // Called by ChatScreen immediately on open (REST, not socket-dependent).
+  // This guarantees MongoDB has the correct readAt before FriendScreen re-fetches
+  // unread counts via useFocusEffect when the user navigates back.
+  app.post('/messages/mark-read', async (req, res) => {
+    try {
+      const { chatId, readerId } = req.body || {};
+      if (!chatId || !readerId) {
+        return res.status(400).json({ error: 'chatId and readerId are required' });
+      }
+      const readAt = new Date();
+      await markConversationRead(chatId, readerId, readAt);
+      console.log(`[mark-read] chatId=${chatId} readerId=${readerId}`);
+      res.json({ ok: true });
+    } catch (err) {
+      console.error('POST /messages/mark-read error:', err);
+      res.status(500).json({ error: 'Unable to mark messages as read' });
+    }
+  });
+
   // ── REST: online status query ────────────────────────────────────────────────
   app.get('/presence/:userId', (req, res) => {
     const userId   = req.params.userId;
