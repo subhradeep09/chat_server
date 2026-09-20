@@ -90,7 +90,7 @@ if (/atlas-sql|\.query\.mongodb\.net/i.test(MONGODB_URI)) {
 
 // ─── Mongoose schemas ─────────────────────────────────────────────────────────
 
-// ── messages collection ──
+// ── 1. messages collection (Personal 1-on-1 Messages) ──
 const messageSchema = new mongoose.Schema(
   {
     chatId:          { type: String, required: true, index: true },
@@ -102,12 +102,51 @@ const messageSchema = new mongoose.Schema(
     deliveredAt:     { type: Date, default: Date.now },
     readAt:          { type: Date, default: null },
   },
-  { timestamps: { createdAt: true, updatedAt: false }, versionKey: false }
+  { timestamps: { createdAt: true, updatedAt: false }, versionKey: false, collection: 'messages' }
 );
 messageSchema.index({ chatId: 1, createdAt: 1 });
+messageSchema.index({ chatId: 1, createdAt: -1 });
 const Message = mongoose.model('Message', messageSchema);
 
-// ── notifytoken collection ──
+// ── 2. group_massages collection (Group Chat Messages) ──
+const groupMessageSchema = new mongoose.Schema(
+  {
+    chatId:          { type: String, required: true, index: true },
+    groupId:         { type: String, required: true, index: true },
+    groupName:       { type: String, default: '' },
+    senderId:        { type: String, required: true, index: true },
+    senderName:      { type: String, required: true },
+    text:            { type: String, required: true, trim: true },
+    clientMessageId: { type: String, default: null, index: true },
+    deliveredAt:     { type: Date, default: Date.now },
+    readAt:          { type: Date, default: null },
+  },
+  { timestamps: { createdAt: true, updatedAt: false }, versionKey: false, collection: 'group_massages' }
+);
+groupMessageSchema.index({ chatId: 1, createdAt: 1 });
+groupMessageSchema.index({ groupId: 1, createdAt: -1 });
+const GroupMessage = mongoose.model('GroupMessage', groupMessageSchema);
+
+// ── 3. group_notification collection (Group Notifications & System Events) ──
+const groupNotificationSchema = new mongoose.Schema(
+  {
+    chatId:          { type: String, required: true, index: true },
+    groupId:         { type: String, required: true, index: true },
+    type:            { type: String, required: true, index: true }, // 'system' | 'invite' | 'invite_accepted' | 'invite_rejected' | 'member_sync' | 'member_left' | 'member_kicked' | 'location' | 'location_stopped'
+    senderId:        { type: String, default: null },
+    senderName:      { type: String, default: null },
+    receiverId:      { type: String, default: 'all' },
+    text:            { type: String, required: true },
+    data:            { type: mongoose.Schema.Types.Mixed, default: null },
+    clientMessageId: { type: String, default: null, index: true },
+  },
+  { timestamps: { createdAt: true, updatedAt: false }, versionKey: false, collection: 'group_notification' }
+);
+groupNotificationSchema.index({ chatId: 1, createdAt: -1 });
+groupNotificationSchema.index({ groupId: 1, type: 1 });
+const GroupNotification = mongoose.model('GroupNotification', groupNotificationSchema);
+
+// ── 4. notifytoken collection ──
 // Stores Expo push tokens permanently in MongoDB (collection: notifytoken).
 // One document per user — upserted on every app login.
 // Survives server restarts unlike the old in-memory Map.
@@ -142,36 +181,151 @@ async function deletePushToken(userId) {
   await NotifyToken.deleteOne({ userId });
 }
 
-function serializeMessage(msg) {
+// ── Helpers for packet classification & serialization ──
+
+function isNotificationPacket(text) {
+  if (!text) return false;
+  return typeof text === 'string' && text.startsWith('[GROUP_');
+}
+
+function parseNotificationPayload(text, chatId) {
+  let type = 'general';
+  let data = null;
+  const match = typeof text === 'string' ? text.match(/^\[(GROUP_[A-Z_]+)\]:(.*)$/s) : null;
+  if (match) {
+    const rawTag = match[1];
+    const payloadStr = match[2];
+    type = rawTag.replace(/^GROUP_/, '').toLowerCase();
+    try {
+      data = JSON.parse(payloadStr);
+    } catch {
+      data = { raw: payloadStr };
+    }
+  }
+  const groupId = (chatId && chatId.startsWith('group_'))
+    ? chatId.replace(/^group_/, '')
+    : (data?.groupId || null);
+
+  return { type, data, groupId };
+}
+
+function serializeRecord(doc) {
   return {
-    id:              String(msg._id),
-    chatId:          msg.chatId,
-    senderId:        msg.senderId,
-    senderName:      msg.senderName,
-    receiverId:      msg.receiverId,
-    text:            msg.text,
-    clientMessageId: msg.clientMessageId || null,
-    createdAt:       msg.createdAt,
-    deliveredAt:     msg.deliveredAt,
-    readAt:          msg.readAt,
+    id:              String(doc._id),
+    chatId:          doc.chatId,
+    groupId:         doc.groupId || (doc.chatId && doc.chatId.startsWith('group_') ? doc.chatId.replace(/^group_/, '') : null),
+    groupName:       doc.groupName || null,
+    senderId:        doc.senderId || null,
+    senderName:      doc.senderName || null,
+    receiverId:      doc.receiverId || (doc.chatId && doc.chatId.startsWith('group_') ? 'all' : null),
+    text:            doc.text,
+    type:            doc.type || null,
+    data:            doc.data || null,
+    clientMessageId: doc.clientMessageId || null,
+    createdAt:       doc.createdAt,
+    deliveredAt:     doc.deliveredAt || doc.createdAt,
+    readAt:          doc.readAt || null,
   };
 }
 
-async function loadMessages(chatId) {
-  const msgs = await Message.find({ chatId }).sort({ createdAt: 1 }).lean();
-  return msgs.map(serializeMessage);
+async function saveIncomingPacket(payload) {
+  const { chatId, senderId, senderName, receiverId, text, clientMessageId } = payload;
+  const isGroup = chatId && chatId.startsWith('group_');
+  const isNotif = isNotificationPacket(text) || payload.isNotification;
+
+  if (isNotif) {
+    // 3. Save to group_notification collection
+    const { type, data, groupId } = parseNotificationPayload(text, chatId);
+    const doc = await GroupNotification.create({
+      chatId,
+      groupId: groupId || (isGroup ? chatId.replace(/^group_/, '') : 'none'),
+      type,
+      senderId: senderId || null,
+      senderName: senderName || 'System',
+      receiverId: receiverId || 'all',
+      text,
+      data,
+      clientMessageId: clientMessageId || null,
+    });
+    return { record: serializeRecord(doc), category: 'group_notification' };
+  } else if (isGroup) {
+    // 2. Save to group_massages collection
+    const groupId = chatId.replace(/^group_/, '');
+    let groupName = payload.groupName || payload.group_name || '';
+
+    // If groupName was not provided in the payload, look it up from group_notification
+    if (!groupName) {
+      try {
+        const knownNotif = await GroupNotification.findOne({
+          groupId,
+          'data.groupName': { $exists: true, $ne: '' }
+        }).lean();
+        if (knownNotif?.data?.groupName) {
+          groupName = knownNotif.data.groupName;
+        }
+      } catch (e) {}
+    }
+
+    const doc = await GroupMessage.create({
+      chatId,
+      groupId,
+      groupName,
+      senderId,
+      senderName: senderName || 'Unknown',
+      text,
+      clientMessageId: clientMessageId || null,
+      deliveredAt: new Date(),
+    });
+    return { record: serializeRecord(doc), category: 'group_message' };
+  } else {
+    // 1. Save to messages collection (personal 1-on-1)
+    const doc = await Message.create({
+      chatId,
+      senderId,
+      senderName: senderName || 'Unknown',
+      receiverId,
+      text,
+      clientMessageId: clientMessageId || null,
+      deliveredAt: new Date(),
+    });
+    return { record: serializeRecord(doc), category: 'message' };
+  }
 }
 
-async function createMessage(payload) {
-  const doc = await Message.create(payload);
-  return serializeMessage(doc);
+async function loadMessages(chatId, limit = 100) {
+  const parsedLimit = Math.min(Math.max(parseInt(limit, 10) || 100, 1), 500);
+  if (chatId.startsWith('group_')) {
+    // Return group chat messages and system announcements for GroupChatScreen history
+    const [groupMsgs, sysNotifs] = await Promise.all([
+      GroupMessage.find({ chatId }).sort({ createdAt: -1 }).limit(parsedLimit).lean(),
+      GroupNotification.find({ chatId, type: { $in: ['system', 'general'] } }).sort({ createdAt: -1 }).limit(parsedLimit).lean(),
+    ]);
+    const combined = [...groupMsgs, ...sysNotifs]
+      .sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime())
+      .slice(-parsedLimit);
+    return combined.map(serializeRecord);
+  } else {
+    // Personal 1-on-1 direct messages
+    const msgs = await Message.find({ chatId })
+      .sort({ createdAt: -1 })
+      .limit(parsedLimit)
+      .lean();
+    return msgs.reverse().map(serializeRecord);
+  }
 }
 
 async function markConversationRead(chatId, readerId, readAt) {
-  await Message.updateMany(
-    { chatId, senderId: { $ne: readerId }, readAt: null },
-    { $set: { readAt } }
-  );
+  if (chatId.startsWith('group_')) {
+    await GroupMessage.updateMany(
+      { chatId, senderId: { $ne: readerId }, readAt: null },
+      { $set: { readAt } }
+    );
+  } else {
+    await Message.updateMany(
+      { chatId, senderId: { $ne: readerId }, readAt: null },
+      { $set: { readAt } }
+    );
+  }
 }
 
 // ─── In-memory presence store ─────────────────────────────────────────────────
@@ -281,53 +435,105 @@ async function main() {
     try {
       const chatId = String(req.query.chatId || '').trim();
       if (!chatId) return res.status(400).json({ error: 'chatId is required' });
-      res.json(await loadMessages(chatId));
+      const limit = req.query.limit ? parseInt(req.query.limit, 10) : 100;
+      res.json(await loadMessages(chatId, limit));
     } catch (err) {
       console.error('GET /messages error:', err);
       res.status(500).json({ error: 'Unable to load messages' });
     }
   });
 
-  // ── REST: send message (fallback when socket offline) ───────────────────────
+  // ── REST: send message / packet (smart routing across the 3 message schemas) ─
   app.post('/messages', async (req, res) => {
     try {
       const { chatId, senderId, senderName, receiverId, text, clientMessageId } = req.body || {};
-      if (!chatId || !senderId || !receiverId || !text)
-        return res.status(400).json({ error: 'chatId, senderId, receiverId, and text are required' });
+      if (!chatId || !senderId || !text)
+        return res.status(400).json({ error: 'chatId, senderId, and text are required' });
 
-      const message = await createMessage({
-        chatId, senderId,
+      const { record, category } = await saveIncomingPacket({
+        chatId,
+        senderId,
         senderName: senderName || 'Unknown',
-        receiverId, text,
+        receiverId: receiverId || (chatId.startsWith('group_') ? 'all' : null),
+        text,
         clientMessageId: clientMessageId || null,
-        deliveredAt: new Date(),
       });
 
       // Deliver to chat room members
-      io.to(chatId).emit('message:new', message);
-
-      // Also push to receiver's background socket (if they are on HomeScreen)
-      const receiverMeta = userPresence.get(receiverId);
-      if (receiverMeta?.socketId) {
-        io.to(receiverMeta.socketId).emit('message:new', message);
+      io.to(chatId).emit('message:new', record);
+      if (category === 'group_message') {
+        io.to(chatId).emit('group_message:new', record);
+      } else if (category === 'group_notification') {
+        io.to(chatId).emit('group_notification:new', record);
       }
 
-      res.status(201).json(message);
+      // Also push to receiver's background socket (if 1-on-1 personal message)
+      if (category === 'message' && receiverId) {
+        const receiverMeta = userPresence.get(receiverId);
+        if (receiverMeta?.socketId) {
+          io.to(receiverMeta.socketId).emit('message:new', record);
+        }
+      }
+
+      res.status(201).json(record);
     } catch (err) {
       console.error('POST /messages error:', err);
       res.status(500).json({ error: 'Unable to save message' });
     }
   });
 
-  // ── REST: delete ALL messages for a chat (called when friends are removed) ──
-  // Permanently wipes the conversation from MongoDB so re-added friends start fresh.
+  // ── REST: load group messages strictly ─────────────────────────────────────
+  app.get('/group-messages', async (req, res) => {
+    try {
+      const chatId = String(req.query.chatId || (req.query.groupId ? `group_${req.query.groupId}` : '')).trim();
+      if (!chatId) return res.status(400).json({ error: 'chatId or groupId is required' });
+      const limit = req.query.limit ? parseInt(req.query.limit, 10) : 100;
+      const parsedLimit = Math.min(Math.max(limit, 1), 500);
+      const msgs = await GroupMessage.find({ chatId }).sort({ createdAt: -1 }).limit(parsedLimit).lean();
+      res.json(msgs.reverse().map(serializeRecord));
+    } catch (err) {
+      console.error('GET /group-messages error:', err);
+      res.status(500).json({ error: 'Unable to load group messages' });
+    }
+  });
+
+  // ── REST: load group notifications strictly ────────────────────────────────
+  app.get('/group-notifications', async (req, res) => {
+    try {
+      const chatId = String(req.query.chatId || (req.query.groupId ? `group_${req.query.groupId}` : '')).trim();
+      if (!chatId) return res.status(400).json({ error: 'chatId or groupId is required' });
+      const type = req.query.type ? String(req.query.type).trim() : null;
+      const limit = req.query.limit ? parseInt(req.query.limit, 10) : 100;
+      const parsedLimit = Math.min(Math.max(limit, 1), 500);
+      const filter = { chatId };
+      if (type) filter.type = type;
+      const notifs = await GroupNotification.find(filter).sort({ createdAt: -1 }).limit(parsedLimit).lean();
+      res.json(notifs.map(serializeRecord));
+    } catch (err) {
+      console.error('GET /group-notifications error:', err);
+      res.status(500).json({ error: 'Unable to load group notifications' });
+    }
+  });
+
+  // ── REST: delete messages for a chat ───────────────────────────────────────
   app.delete('/messages', async (req, res) => {
     try {
       const chatId = String(req.query.chatId || '').trim();
       if (!chatId) return res.status(400).json({ error: 'chatId is required' });
-      const result = await Message.deleteMany({ chatId });
-      console.log(`[messages] Deleted ${result.deletedCount} messages for chatId=${chatId}`);
-      res.json({ ok: true, deletedCount: result.deletedCount });
+
+      if (chatId.startsWith('group_')) {
+        const [delMsgs, delNotifs] = await Promise.all([
+          GroupMessage.deleteMany({ chatId }),
+          GroupNotification.deleteMany({ chatId }),
+        ]);
+        const total = (delMsgs.deletedCount || 0) + (delNotifs.deletedCount || 0);
+        console.log(`[group] Deleted ${total} records for chatId=${chatId}`);
+        res.json({ ok: true, deletedCount: total });
+      } else {
+        const result = await Message.deleteMany({ chatId });
+        console.log(`[messages] Deleted ${result.deletedCount} messages for chatId=${chatId}`);
+        res.json({ ok: true, deletedCount: result.deletedCount });
+      }
     } catch (err) {
       console.error('DELETE /messages error:', err);
       res.status(500).json({ error: 'Unable to delete messages' });
@@ -542,55 +748,89 @@ async function main() {
     socket.on('message:send', async (payload, ack) => {
       try {
         const { chatId: roomId, senderId, senderName, receiverId, text, clientMessageId } = payload || {};
-        if (!roomId || !senderId || !receiverId || !text) {
+        if (!roomId || !senderId || !text) {
           if (typeof ack === 'function') ack({ ok: false, error: 'Missing required message fields' });
           return;
         }
 
-        const message = await createMessage({
-          chatId:          roomId,
-          senderId,
-          senderName:      senderName || 'Unknown',
-          receiverId,
-          text,
-          clientMessageId: clientMessageId || null,
-          deliveredAt:     new Date(),
-        });
+        const { record, category } = await saveIncomingPacket(payload);
 
         // Deliver to everyone in the chat room
-        io.to(roomId).emit('message:new', message);
+        io.to(roomId).emit('message:new', record);
+        if (category === 'group_message') {
+          io.to(roomId).emit('group_message:new', record);
+        } else if (category === 'group_notification') {
+          io.to(roomId).emit('group_notification:new', record);
+        }
 
         // ── In-app toast: find receiver's background socket and emit directly ──
-        // We search socketMeta (not userPresence) because userPresence may have
-        // a stale/disconnected chat socket ID if the user left a chat room.
-        for (const [sid, meta] of socketMeta.entries()) {
-          if (meta.userId === receiverId && meta.mode === 'background') {
-            const bgSock = io.sockets.sockets.get(sid);
-            if (bgSock) {
-              bgSock.emit('message:new', message);
-              console.log(`[toast] Sent message:new to background socket of userId=${receiverId}`);
+        if (category === 'message' && receiverId) {
+          for (const [sid, meta] of socketMeta.entries()) {
+            if (meta.userId === receiverId && meta.mode === 'background') {
+              const bgSock = io.sockets.sockets.get(sid);
+              if (bgSock) {
+                bgSock.emit('message:new', record);
+                console.log(`[toast] Sent message:new to background socket of userId=${receiverId}`);
+              }
             }
           }
         }
 
         // ── Send FCM push notification (mobile system tray) via firebase-admin ─────
-        // Only send if receiver is NOT currently active in this chat room.
-        const receiverMeta = userPresence.get(receiverId);
-        const receiverInRoom = receiverMeta?.chatId === roomId && receiverMeta?.isActive;
-        if (!receiverInRoom) {
-          const fcmToken = await getPushToken(receiverId);
-          await sendFCMNotification(
-            fcmToken,
-            senderName || 'New message',
-            text.length > 100 ? text.slice(0, 97) + '…' : text,
-            { otherUserId: senderId, senderName: senderName || 'Someone', chatId: roomId }
-          );
+        if (category === 'message' && receiverId) {
+          const receiverMeta = userPresence.get(receiverId);
+          const receiverInRoom = receiverMeta?.chatId === roomId && receiverMeta?.isActive;
+          if (!receiverInRoom) {
+            const fcmToken = await getPushToken(receiverId);
+            await sendFCMNotification(
+              fcmToken,
+              senderName || 'New message',
+              text.length > 100 ? text.slice(0, 97) + '…' : text,
+              { otherUserId: senderId, senderName: senderName || 'Someone', chatId: roomId }
+            );
+          }
         }
 
-        if (typeof ack === 'function') ack({ ok: true, message });
+        if (typeof ack === 'function') ack({ ok: true, message: record });
       } catch (err) {
         console.error('message:send error:', err);
         if (typeof ack === 'function') ack({ ok: false, error: 'Unable to save message' });
+      }
+    });
+
+    // ── group_message:send ───────────────────────────────────────────────────
+    socket.on('group_message:send', async (payload, ack) => {
+      try {
+        const { chatId: roomId, senderId, text } = payload || {};
+        if (!roomId || !senderId || !text) {
+          if (typeof ack === 'function') ack({ ok: false, error: 'Missing required group message fields' });
+          return;
+        }
+        const { record } = await saveIncomingPacket({ ...payload, chatId: roomId });
+        io.to(roomId).emit('group_message:new', record);
+        io.to(roomId).emit('message:new', record);
+        if (typeof ack === 'function') ack({ ok: true, message: record });
+      } catch (err) {
+        console.error('group_message:send error:', err);
+        if (typeof ack === 'function') ack({ ok: false, error: 'Unable to save group message' });
+      }
+    });
+
+    // ── group_notification:send ──────────────────────────────────────────────
+    socket.on('group_notification:send', async (payload, ack) => {
+      try {
+        const { chatId: roomId, text } = payload || {};
+        if (!roomId || !text) {
+          if (typeof ack === 'function') ack({ ok: false, error: 'Missing required notification fields' });
+          return;
+        }
+        const { record } = await saveIncomingPacket({ ...payload, chatId: roomId, isNotification: true });
+        io.to(roomId).emit('group_notification:new', record);
+        io.to(roomId).emit('message:new', record);
+        if (typeof ack === 'function') ack({ ok: true, message: record });
+      } catch (err) {
+        console.error('group_notification:send error:', err);
+        if (typeof ack === 'function') ack({ ok: false, error: 'Unable to save group notification' });
       }
     });
 
