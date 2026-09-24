@@ -330,12 +330,12 @@ async function saveIncomingPacket(payload) {
       deliveredAt: new Date(),
     });
 
-    // Also persist to GroupNotification if it's a group room or group invite for backward compatibility
-    if (isGroup || type.includes('invite') || type.startsWith('member_')) {
+    // Only persist to GroupNotification if it's an actual group room (starts with group_)
+    if (isGroup) {
       try {
         await GroupNotification.create({
           chatId,
-          groupId: groupId || (isGroup ? chatId.replace(/^group_/, '') : 'none'),
+          groupId: groupId || chatId.replace(/^group_/, ''),
           type,
           senderId: senderId || null,
           senderName: senderName || 'System',
@@ -482,15 +482,26 @@ async function loadMessages(chatId, limit = 100) {
     combined.sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime());
     return combined.slice(-parsedLimit).map(serializeRecord);
   } else {
-    // Personal 1-on-1 direct messages (include Message, MassageNotification, and GroupNotification)
-    const [msgs, massageNotifs, notifs] = await Promise.all([
+    // Personal 1-on-1 direct messages (include Message and MassageNotification)
+    const [msgs, massageNotifs] = await Promise.all([
       Message.find({ chatId }).sort({ createdAt: -1 }).limit(parsedLimit).lean(),
       MassageNotification.find({ chatId }).sort({ createdAt: -1 }).limit(parsedLimit).lean(),
-      GroupNotification.find({ chatId }).sort({ createdAt: -1 }).limit(parsedLimit).lean(),
     ]);
     const seen = new Set();
+    const seenGroupInvites = new Set();
     const combined = [];
-    for (const item of [...msgs, ...massageNotifs, ...notifs]) {
+    for (const item of [...msgs, ...massageNotifs]) {
+      // Deduplicate group invite cards by groupId
+      if (item.text?.startsWith('[GROUP_INVITE]:')) {
+        try {
+          const inv = JSON.parse(item.text.replace('[GROUP_INVITE]:', ''));
+          if (inv?.groupId) {
+            if (seenGroupInvites.has(inv.groupId)) continue;
+            seenGroupInvites.add(inv.groupId);
+          }
+        } catch {}
+      }
+
       const key = item.clientMessageId || String(item._id);
       if (!seen.has(key)) {
         seen.add(key);
@@ -675,11 +686,13 @@ async function main() {
 
       // Also push to receiver's background socket on ANY page (HomeScreen, Friends, etc.)
       if (receiverId && receiverId !== 'all') {
+        const sentUserIds = new Set();
         for (const [sid, meta] of socketMeta.entries()) {
-          if (meta.userId === receiverId && meta.chatId !== chatId) {
+          if (meta.userId === receiverId && meta.chatId !== chatId && !sentUserIds.has(meta.userId)) {
             const destSock = io.sockets.sockets.get(sid);
             if (destSock) {
               destSock.emit('message:new', record);
+              sentUserIds.add(meta.userId);
               console.log(`[POST /messages] Forwarded message:new to receiver socket sid=${sid} (mode=${meta.mode})`);
             }
           }
@@ -1211,11 +1224,13 @@ async function main() {
 
         // ── In-app toast: find receiver's socket and emit directly on ANY page ──
         if (receiverId && receiverId !== 'all') {
+          const sentUserIds = new Set();
           for (const [sid, meta] of socketMeta.entries()) {
-            if (meta.userId === receiverId && meta.chatId !== roomId) {
+            if (meta.userId === receiverId && meta.chatId !== roomId && !sentUserIds.has(meta.userId)) {
               const bgSock = io.sockets.sockets.get(sid);
               if (bgSock) {
                 bgSock.emit('message:new', record);
+                sentUserIds.add(meta.userId);
                 console.log(`[toast] Sent message:new to receiver socket of userId=${receiverId} (mode=${meta.mode})`);
               }
             }
