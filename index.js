@@ -101,6 +101,10 @@ const messageSchema = new mongoose.Schema(
     clientMessageId: { type: String, default: null, index: true },
     deliveredAt:     { type: Date, default: Date.now },
     readAt:          { type: Date, default: null },
+    replyTo:         { type: mongoose.Schema.Types.Mixed, default: null },
+    isEdited:        { type: Boolean, default: false },
+    editedAt:        { type: Date, default: null },
+    reactions:       { type: Array, default: [] },
   },
   { timestamps: { createdAt: true, updatedAt: false }, versionKey: false, collection: 'messages' }
 );
@@ -120,6 +124,10 @@ const groupMessageSchema = new mongoose.Schema(
     clientMessageId: { type: String, default: null, index: true },
     deliveredAt:     { type: Date, default: Date.now },
     readAt:          { type: Date, default: null },
+    replyTo:         { type: mongoose.Schema.Types.Mixed, default: null },
+    isEdited:        { type: Boolean, default: false },
+    editedAt:        { type: Date, default: null },
+    reactions:       { type: Array, default: [] },
   },
   { timestamps: { createdAt: true, updatedAt: false }, versionKey: false, collection: 'group_massages' }
 );
@@ -222,6 +230,10 @@ function serializeRecord(doc) {
     type:            doc.type || null,
     data:            doc.data || null,
     clientMessageId: doc.clientMessageId || null,
+    replyTo:         doc.replyTo || null,
+    isEdited:        Boolean(doc.isEdited),
+    editedAt:        doc.editedAt || null,
+    reactions:       Array.isArray(doc.reactions) ? doc.reactions : [],
     createdAt:       doc.createdAt,
     deliveredAt:     doc.deliveredAt || doc.createdAt,
     readAt:          doc.readAt || null,
@@ -229,12 +241,44 @@ function serializeRecord(doc) {
 }
 
 async function saveIncomingPacket(payload) {
-  const { chatId, senderId, senderName, receiverId, text, clientMessageId } = payload;
+  const { chatId, senderId, senderName, receiverId, text, clientMessageId, replyTo } = payload;
   const isGroup = chatId && chatId.startsWith('group_');
   const isNotif = isNotificationPacket(text) || payload.isNotification;
 
-  if (isNotif) {
-    // 3. Save to group_notification collection
+  if (!isGroup) {
+    // 1. Personal 1-on-1 direct message (including [GROUP_INVITE], [GROUP_INVITE_REJECTED], etc.)
+    const doc = await Message.create({
+      chatId,
+      senderId,
+      senderName: senderName || 'Unknown',
+      receiverId,
+      text,
+      clientMessageId: clientMessageId || null,
+      replyTo: replyTo || null,
+      deliveredAt: new Date(),
+    });
+
+    // Also persist to GroupNotification if it's an invite packet for redundant lookup
+    if (isNotif) {
+      try {
+        const { type, data, groupId } = parseNotificationPayload(text, chatId);
+        await GroupNotification.create({
+          chatId,
+          groupId: groupId || 'none',
+          type,
+          senderId: senderId || null,
+          senderName: senderName || 'System',
+          receiverId: receiverId || 'all',
+          text,
+          data,
+          clientMessageId: clientMessageId || null,
+        });
+      } catch (e) {}
+    }
+
+    return { record: serializeRecord(doc), category: 'message' };
+  } else if (isNotif) {
+    // 2. Group room notification / system packet
     const { type, data, groupId } = parseNotificationPayload(text, chatId);
     const doc = await GroupNotification.create({
       chatId,
@@ -274,6 +318,7 @@ async function saveIncomingPacket(payload) {
       senderName: senderName || 'Unknown',
       text,
       clientMessageId: clientMessageId || null,
+      replyTo: replyTo || null,
       deliveredAt: new Date(),
     });
     return { record: serializeRecord(doc), category: 'group_message' };
@@ -286,10 +331,73 @@ async function saveIncomingPacket(payload) {
       receiverId,
       text,
       clientMessageId: clientMessageId || null,
+      replyTo: replyTo || null,
       deliveredAt: new Date(),
     });
     return { record: serializeRecord(doc), category: 'message' };
   }
+}
+
+async function editMessageInDb({ chatId, messageId, clientMessageId, newText, senderId }) {
+  if (!chatId || !newText) return null;
+  const isGroup = chatId.startsWith('group_');
+  const Model = isGroup ? GroupMessage : Message;
+
+  let doc = null;
+  if (messageId && mongoose.isValidObjectId(messageId)) {
+    doc = await Model.findById(messageId);
+  }
+  if (!doc && clientMessageId) {
+    doc = await Model.findOne({ chatId, clientMessageId });
+  }
+  if (!doc && messageId) {
+    doc = await Model.findOne({ chatId, clientMessageId: messageId });
+  }
+  if (!doc) return null;
+
+  doc.text = newText.trim();
+  doc.isEdited = true;
+  doc.editedAt = new Date();
+  await doc.save();
+  return serializeRecord(doc);
+}
+
+async function reactToMessageInDb({ chatId, messageId, clientMessageId, userId, userName, emoji }) {
+  if (!chatId || !userId || !emoji) return null;
+  const isGroup = chatId.startsWith('group_');
+  const Model = isGroup ? GroupMessage : Message;
+
+  let doc = null;
+  if (messageId && mongoose.isValidObjectId(messageId)) {
+    doc = await Model.findById(messageId);
+  }
+  if (!doc && clientMessageId) {
+    doc = await Model.findOne({ chatId, clientMessageId });
+  }
+  if (!doc && messageId) {
+    doc = await Model.findOne({ chatId, clientMessageId: messageId });
+  }
+  if (!doc) return null;
+
+  let reactions = Array.isArray(doc.reactions) ? [...doc.reactions] : [];
+  const existingIdx = reactions.findIndex((r) => r.userId === userId);
+
+  if (existingIdx >= 0) {
+    if (reactions[existingIdx].emoji === emoji) {
+      // Toggle off
+      reactions.splice(existingIdx, 1);
+    } else {
+      // Switch emoji
+      reactions[existingIdx] = { userId, userName: userName || '', emoji };
+    }
+  } else {
+    reactions.push({ userId, userName: userName || '', emoji });
+  }
+
+  doc.reactions = reactions;
+  doc.markModified('reactions');
+  await doc.save();
+  return serializeRecord(doc);
 }
 
 async function loadMessages(chatId, limit = 100) {
@@ -305,12 +413,22 @@ async function loadMessages(chatId, limit = 100) {
       .slice(-parsedLimit);
     return combined.map(serializeRecord);
   } else {
-    // Personal 1-on-1 direct messages
-    const msgs = await Message.find({ chatId })
-      .sort({ createdAt: -1 })
-      .limit(parsedLimit)
-      .lean();
-    return msgs.reverse().map(serializeRecord);
+    // Personal 1-on-1 direct messages (include both Message and any existing GroupNotification records)
+    const [msgs, notifs] = await Promise.all([
+      Message.find({ chatId }).sort({ createdAt: -1 }).limit(parsedLimit).lean(),
+      GroupNotification.find({ chatId }).sort({ createdAt: -1 }).limit(parsedLimit).lean(),
+    ]);
+    const seen = new Set();
+    const combined = [];
+    for (const item of [...msgs, ...notifs]) {
+      const key = item.clientMessageId || String(item._id);
+      if (!seen.has(key)) {
+        seen.add(key);
+        combined.push(item);
+      }
+    }
+    combined.sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime());
+    return combined.slice(-parsedLimit).map(serializeRecord);
   }
 }
 
@@ -467,11 +585,16 @@ async function main() {
         io.to(chatId).emit('group_notification:new', record);
       }
 
-      // Also push to receiver's background socket (if 1-on-1 personal message)
-      if (category === 'message' && receiverId) {
-        const receiverMeta = userPresence.get(receiverId);
-        if (receiverMeta?.socketId) {
-          io.to(receiverMeta.socketId).emit('message:new', record);
+      // Also push to receiver's background socket on ANY page (HomeScreen, Friends, etc.)
+      if (receiverId && receiverId !== 'all') {
+        for (const [sid, meta] of socketMeta.entries()) {
+          if (meta.userId === receiverId && meta.chatId !== chatId) {
+            const destSock = io.sockets.sockets.get(sid);
+            if (destSock) {
+              destSock.emit('message:new', record);
+              console.log(`[POST /messages] Forwarded message:new to receiver socket sid=${sid} (mode=${meta.mode})`);
+            }
+          }
         }
       }
 
@@ -479,6 +602,58 @@ async function main() {
     } catch (err) {
       console.error('POST /messages error:', err);
       res.status(500).json({ error: 'Unable to save message' });
+    }
+  });
+
+  // ── REST: edit message ─────────────────────────────────────────────────────
+  app.post('/messages/edit', async (req, res) => {
+    try {
+      const { chatId, messageId, clientMessageId, newText, senderId } = req.body || {};
+      if (!chatId || !newText || (!messageId && !clientMessageId)) {
+        return res.status(400).json({ error: 'chatId, newText, and messageId are required' });
+      }
+
+      const record = await editMessageInDb({ chatId, messageId, clientMessageId, newText, senderId });
+      if (!record) {
+        return res.status(404).json({ error: 'Message not found' });
+      }
+
+      // Broadcast edit to room
+      io.to(chatId).emit('message:edited', record);
+      if (chatId.startsWith('group_')) {
+        io.to(chatId).emit('group_message:edited', record);
+      }
+
+      res.json({ ok: true, message: record });
+    } catch (err) {
+      console.error('POST /messages/edit error:', err);
+      res.status(500).json({ error: 'Unable to edit message' });
+    }
+  });
+
+  // ── REST: react to message ──────────────────────────────────────────────────
+  app.post('/messages/react', async (req, res) => {
+    try {
+      const { chatId, messageId, clientMessageId, userId, userName, emoji } = req.body || {};
+      if (!chatId || !userId || !emoji || (!messageId && !clientMessageId)) {
+        return res.status(400).json({ error: 'chatId, userId, emoji, and messageId are required' });
+      }
+
+      const record = await reactToMessageInDb({ chatId, messageId, clientMessageId, userId, userName, emoji });
+      if (!record) {
+        return res.status(404).json({ error: 'Message not found' });
+      }
+
+      // Broadcast reaction to room
+      io.to(chatId).emit('message:reacted', record);
+      if (chatId.startsWith('group_')) {
+        io.to(chatId).emit('group_message:reacted', record);
+      }
+
+      res.json({ ok: true, message: record });
+    } catch (err) {
+      console.error('POST /messages/react error:', err);
+      res.status(500).json({ error: 'Unable to react to message' });
     }
   });
 
@@ -497,6 +672,69 @@ async function main() {
     }
   });
 
+  // ── REST: get pending group invites for a user ─────────────────────────────
+  app.get('/group-invites', async (req, res) => {
+    try {
+      const userId = String(req.query.userId || '').trim();
+      if (!userId) return res.status(400).json({ error: 'userId is required' });
+
+      // Find in messages collection and group_notification collection
+      const [inviteMsgs, notifs] = await Promise.all([
+        Message.find({
+          receiverId: userId,
+          text: { $regex: '^\\[GROUP_INVITE\\]:' }
+        }).sort({ createdAt: -1 }).limit(50).lean(),
+        GroupNotification.find({
+          receiverId: userId,
+          type: 'invite'
+        }).sort({ createdAt: -1 }).limit(50).lean(),
+      ]);
+
+      const invites = [];
+      const seenGroupIds = new Set();
+
+      // Parse from inviteMsgs first (newest first)
+      for (const m of inviteMsgs) {
+        try {
+          const inv = JSON.parse(m.text.replace('[GROUP_INVITE]:', ''));
+          if (inv?.groupId && !seenGroupIds.has(inv.groupId)) {
+            seenGroupIds.add(inv.groupId);
+            invites.push({
+              ...inv,
+              status: inv.status || 'pending',
+              messageId: String(m._id),
+              clientMessageId: m.clientMessageId,
+              timestamp: m.createdAt || inv.timestamp,
+            });
+          }
+        } catch {}
+      }
+
+      // Also parse from notifs
+      for (const n of notifs) {
+        try {
+          let inv = n.data;
+          if (typeof inv === 'string') inv = JSON.parse(inv);
+          if (inv?.groupId && !seenGroupIds.has(inv.groupId)) {
+            seenGroupIds.add(inv.groupId);
+            invites.push({
+              ...inv,
+              status: inv.status || 'pending',
+              messageId: String(n._id),
+              clientMessageId: n.clientMessageId,
+              timestamp: n.createdAt || inv.timestamp,
+            });
+          }
+        } catch {}
+      }
+
+      res.json(invites);
+    } catch (err) {
+      console.error('GET /group-invites error:', err);
+      res.status(500).json({ error: 'Unable to load group invites' });
+    }
+  });
+
   // ── REST: load group notifications strictly ────────────────────────────────
   app.get('/group-notifications', async (req, res) => {
     try {
@@ -512,6 +750,53 @@ async function main() {
     } catch (err) {
       console.error('GET /group-notifications error:', err);
       res.status(500).json({ error: 'Unable to load group notifications' });
+    }
+  });
+
+  // ── REST: rename a group ──────────────────────────────────────────────────
+  app.post('/groups/rename', async (req, res) => {
+    try {
+      const { groupId, newName, userId, userName } = req.body || {};
+      if (!groupId || !newName) {
+        return res.status(400).json({ error: 'groupId and newName are required' });
+      }
+      const cleanName = String(newName).trim();
+      const chatId = `group_${groupId}`;
+
+      // 1. Update groupName in all messages for this group in group_massages
+      await GroupMessage.updateMany(
+        { $or: [{ groupId }, { chatId }] },
+        { $set: { groupName: cleanName } }
+      );
+
+      // 2. Save a record in group_notification
+      const notifDoc = new GroupNotification({
+        chatId,
+        groupId,
+        type: 'name_updated',
+        data: {
+          groupId,
+          groupName: cleanName,
+          updatedBy: userId || 'unknown',
+          updatedByName: userName || 'Admin',
+        },
+        createdAt: new Date(),
+      });
+      await notifDoc.save();
+
+      // 3. Broadcast to socket room
+      io.to(chatId).emit('group:updated', {
+        groupId,
+        groupName: cleanName,
+        updatedBy: userId,
+        updatedByName: userName,
+      });
+
+      console.log(`[group] Renamed group ${groupId} to "${cleanName}" by ${userName || userId}`);
+      res.json({ ok: true, groupId, groupName: cleanName });
+    } catch (err) {
+      console.error('POST /groups/rename error:', err);
+      res.status(500).json({ error: 'Failed to rename group' });
     }
   });
 
@@ -763,14 +1048,14 @@ async function main() {
           io.to(roomId).emit('group_notification:new', record);
         }
 
-        // ── In-app toast: find receiver's background socket and emit directly ──
-        if (category === 'message' && receiverId) {
+        // ── In-app toast: find receiver's socket and emit directly on ANY page ──
+        if (receiverId && receiverId !== 'all') {
           for (const [sid, meta] of socketMeta.entries()) {
-            if (meta.userId === receiverId && meta.mode === 'background') {
+            if (meta.userId === receiverId && meta.chatId !== roomId) {
               const bgSock = io.sockets.sockets.get(sid);
               if (bgSock) {
                 bgSock.emit('message:new', record);
-                console.log(`[toast] Sent message:new to background socket of userId=${receiverId}`);
+                console.log(`[toast] Sent message:new to receiver socket of userId=${receiverId} (mode=${meta.mode})`);
               }
             }
           }
@@ -831,6 +1116,105 @@ async function main() {
       } catch (err) {
         console.error('group_notification:send error:', err);
         if (typeof ack === 'function') ack({ ok: false, error: 'Unable to save group notification' });
+      }
+    });
+
+    // ── message:edit ──────────────────────────────────────────────────────────
+    socket.on('message:edit', async (payload, ack) => {
+      try {
+        const { chatId: roomId, messageId, clientMessageId, newText, senderId } = payload || {};
+        if (!roomId || !newText || (!messageId && !clientMessageId)) {
+          if (typeof ack === 'function') ack({ ok: false, error: 'Missing required edit fields' });
+          return;
+        }
+
+        const record = await editMessageInDb({ chatId: roomId, messageId, clientMessageId, newText, senderId });
+        if (!record) {
+          if (typeof ack === 'function') ack({ ok: false, error: 'Message not found' });
+          return;
+        }
+
+        io.to(roomId).emit('message:edited', record);
+        if (roomId.startsWith('group_')) {
+          io.to(roomId).emit('group_message:edited', record);
+        }
+
+        if (typeof ack === 'function') ack({ ok: true, message: record });
+      } catch (err) {
+        console.error('message:edit error:', err);
+        if (typeof ack === 'function') ack({ ok: false, error: 'Unable to edit message' });
+      }
+    });
+
+    // ── message:react ─────────────────────────────────────────────────────────
+    socket.on('message:react', async (payload, ack) => {
+      try {
+        const { chatId: roomId, messageId, clientMessageId, userId, userName, emoji } = payload || {};
+        if (!roomId || !userId || !emoji || (!messageId && !clientMessageId)) {
+          if (typeof ack === 'function') ack({ ok: false, error: 'Missing required reaction fields' });
+          return;
+        }
+
+        const record = await reactToMessageInDb({ chatId: roomId, messageId, clientMessageId, userId, userName, emoji });
+        if (!record) {
+          if (typeof ack === 'function') ack({ ok: false, error: 'Message not found' });
+          return;
+        }
+
+        io.to(roomId).emit('message:reacted', record);
+        if (roomId.startsWith('group_')) {
+          io.to(roomId).emit('group_message:reacted', record);
+        }
+
+        if (typeof ack === 'function') ack({ ok: true, message: record });
+      } catch (err) {
+        console.error('message:react error:', err);
+        if (typeof ack === 'function') ack({ ok: false, error: 'Unable to react to message' });
+      }
+    });
+
+    // ── group:rename ──────────────────────────────────────────────────────────
+    socket.on('group:rename', async (payload, ack) => {
+      try {
+        const { groupId, newName, userId, userName } = payload || {};
+        if (!groupId || !newName) {
+          if (typeof ack === 'function') ack({ ok: false, error: 'Missing groupId or newName' });
+          return;
+        }
+        const cleanName = String(newName).trim();
+        const chatId = `group_${groupId}`;
+
+        await GroupMessage.updateMany(
+          { $or: [{ groupId }, { chatId }] },
+          { $set: { groupName: cleanName } }
+        );
+
+        const notifDoc = new GroupNotification({
+          chatId,
+          groupId,
+          type: 'name_updated',
+          data: {
+            groupId,
+            groupName: cleanName,
+            updatedBy: userId || 'unknown',
+            updatedByName: userName || 'Admin',
+          },
+          createdAt: new Date(),
+        });
+        await notifDoc.save();
+
+        io.to(chatId).emit('group:updated', {
+          groupId,
+          groupName: cleanName,
+          updatedBy: userId,
+          updatedByName: userName,
+        });
+
+        console.log(`[group] Socket renamed group ${groupId} to "${cleanName}"`);
+        if (typeof ack === 'function') ack({ ok: true, groupId, groupName: cleanName });
+      } catch (err) {
+        console.error('group:rename error:', err);
+        if (typeof ack === 'function') ack({ ok: false, error: 'Failed to rename group' });
       }
     });
 
