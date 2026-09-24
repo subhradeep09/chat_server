@@ -347,6 +347,39 @@ async function saveIncomingPacket(payload) {
       } catch (e) {}
     }
 
+    // If a member was kicked, purge any old group invite messages for that user & group
+    if (type === 'member_kicked') {
+      const targetUserId = data?.targetUserId || data?.kickedUserId;
+      const kickGroupId = groupId || data?.groupId;
+      if (targetUserId && kickGroupId) {
+        try {
+          const inviteRegex = new RegExp(`\\[GROUP_INVITE\\]:.*"groupId":"${kickGroupId}"`);
+          await Promise.all([
+            MassageNotification.deleteMany({
+              $or: [
+                { receiverId: targetUserId, groupId: kickGroupId },
+                { receiverId: targetUserId, text: { $regex: inviteRegex } },
+                { type: 'invite', groupId: kickGroupId, receiverId: targetUserId },
+                { type: 'group_invite', groupId: kickGroupId, receiverId: targetUserId }
+              ]
+            }),
+            Message.deleteMany({
+              $or: [{ receiverId: targetUserId }, { senderId: targetUserId }],
+              text: { $regex: inviteRegex }
+            }),
+            GroupNotification.deleteMany({
+              groupId: kickGroupId,
+              receiverId: targetUserId,
+              type: 'invite'
+            })
+          ]);
+          console.log(`[member_kicked] Purged old group invites for userId=${targetUserId} in groupId=${kickGroupId}`);
+        } catch (e) {
+          console.warn('[member_kicked] Failed to purge old invites:', e);
+        }
+      }
+    }
+
     return { record: serializeRecord(doc), category: 'massage_notification' };
   }
 
@@ -483,19 +516,33 @@ async function loadMessages(chatId, limit = 100) {
     return combined.slice(-parsedLimit).map(serializeRecord);
   } else {
     // Personal 1-on-1 direct messages (include Message and MassageNotification)
-    const [msgs, massageNotifs] = await Promise.all([
+    const [msgs, massageNotifs, kickedNotifs] = await Promise.all([
       Message.find({ chatId }).sort({ createdAt: -1 }).limit(parsedLimit).lean(),
       MassageNotification.find({ chatId }).sort({ createdAt: -1 }).limit(parsedLimit).lean(),
+      MassageNotification.find({ type: 'member_kicked' }).sort({ createdAt: -1 }).limit(100).lean(),
     ]);
+
+    const kickedPairs = new Set();
+    for (const kn of kickedNotifs) {
+      const gid = kn.groupId || kn.data?.groupId;
+      const uid = kn.data?.targetUserId || kn.data?.kickedUserId;
+      if (gid && uid) kickedPairs.add(`${gid}_${uid}`);
+    }
+
     const seen = new Set();
     const seenGroupInvites = new Set();
     const combined = [];
     for (const item of [...msgs, ...massageNotifs]) {
-      // Deduplicate group invite cards by groupId
+      // Deduplicate group invite cards by groupId and suppress if member was kicked
       if (item.text?.startsWith('[GROUP_INVITE]:')) {
         try {
           const inv = JSON.parse(item.text.replace('[GROUP_INVITE]:', ''));
           if (inv?.groupId) {
+            const targetUid = item.receiverId || inv.inviteeId;
+            if (targetUid && kickedPairs.has(`${inv.groupId}_${targetUid}`)) {
+              // User was kicked from this group — never return this invite card
+              continue;
+            }
             if (seenGroupInvites.has(inv.groupId)) continue;
             seenGroupInvites.add(inv.groupId);
           }
@@ -795,7 +842,7 @@ async function main() {
       if (!userId) return res.status(400).json({ error: 'userId is required' });
 
       // Find in messages collection, massage_notification collection, and group_notification collection
-      const [inviteMsgs, massageNotifs, notifs] = await Promise.all([
+      const [inviteMsgs, massageNotifs, notifs, kickedNotifs] = await Promise.all([
         Message.find({
           receiverId: userId,
           text: { $regex: '^\\[GROUP_INVITE\\]:' }
@@ -811,8 +858,16 @@ async function main() {
           receiverId: userId,
           type: 'invite'
         }).sort({ createdAt: -1 }).limit(50).lean(),
+        MassageNotification.find({
+          type: 'member_kicked',
+          $or: [
+            { 'data.targetUserId': userId },
+            { 'data.kickedUserId': userId }
+          ]
+        }).sort({ createdAt: -1 }).limit(50).lean(),
       ]);
 
+      const kickedGroupIds = new Set(kickedNotifs.map(n => n.groupId || n.data?.groupId).filter(Boolean));
       const invites = [];
       const seenGroupIds = new Set();
 
@@ -820,7 +875,7 @@ async function main() {
       for (const m of [...inviteMsgs, ...massageNotifs]) {
         try {
           const inv = JSON.parse(m.text.replace('[GROUP_INVITE]:', ''));
-          if (inv?.groupId && !seenGroupIds.has(inv.groupId)) {
+          if (inv?.groupId && !kickedGroupIds.has(inv.groupId) && !seenGroupIds.has(inv.groupId)) {
             seenGroupIds.add(inv.groupId);
             invites.push({
               ...inv,
@@ -838,7 +893,7 @@ async function main() {
         try {
           let inv = n.data;
           if (typeof inv === 'string') inv = JSON.parse(inv);
-          if (inv?.groupId && !seenGroupIds.has(inv.groupId)) {
+          if (inv?.groupId && !kickedGroupIds.has(inv.groupId) && !seenGroupIds.has(inv.groupId)) {
             seenGroupIds.add(inv.groupId);
             invites.push({
               ...inv,
