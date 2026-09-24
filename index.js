@@ -154,6 +154,30 @@ groupNotificationSchema.index({ chatId: 1, createdAt: -1 });
 groupNotificationSchema.index({ groupId: 1, type: 1 });
 const GroupNotification = mongoose.model('GroupNotification', groupNotificationSchema);
 
+// ── 4. massage_notification collection (Message & 1-on-1 Notifications / System Events) ──
+// Stores message notification events (e.g. location share off, group invites & status in 1-on-1 chats)
+const massageNotificationSchema = new mongoose.Schema(
+  {
+    chatId:          { type: String, required: true, index: true },
+    type:            { type: String, required: true, index: true }, // 'location_stopped' | 'invite' | 'invite_accepted' | 'invite_rejected' | 'member_sync' | 'member_left' | 'member_kicked' | 'location' | 'location_stopped' | 'system' | 'general'
+    senderId:        { type: String, default: null, index: true },
+    senderName:      { type: String, default: null },
+    receiverId:      { type: String, default: null, index: true },
+    groupId:         { type: String, default: null, index: true },
+    groupName:       { type: String, default: '' },
+    text:            { type: String, required: true },
+    data:            { type: mongoose.Schema.Types.Mixed, default: null },
+    clientMessageId: { type: String, default: null, index: true },
+    deliveredAt:     { type: Date, default: Date.now },
+    readAt:          { type: Date, default: null },
+  },
+  { timestamps: { createdAt: true, updatedAt: false }, versionKey: false, collection: 'massage_notification' }
+);
+massageNotificationSchema.index({ chatId: 1, createdAt: -1 });
+massageNotificationSchema.index({ receiverId: 1, type: 1 });
+massageNotificationSchema.index({ groupId: 1, createdAt: -1 });
+const MassageNotification = mongoose.model('MassageNotification', massageNotificationSchema);
+
 // ── 4. notifytoken collection ──
 // Stores Expo push tokens permanently in MongoDB (collection: notifytoken).
 // One document per user — upserted on every app login.
@@ -194,6 +218,50 @@ async function deletePushToken(userId) {
 function isNotificationPacket(text) {
   if (!text) return false;
   return typeof text === 'string' && text.startsWith('[GROUP_');
+}
+
+function isMassageNotificationPacket(text) {
+  if (!text || typeof text !== 'string') return false;
+  return (
+    text.startsWith('[GROUP_') ||
+    text.startsWith('[LIVE_LOCATION_STOPPED]:') ||
+    text.startsWith('[LOCATION_STOPPED]:')
+  );
+}
+
+function parseMassageNotification(text, chatId, payload = {}) {
+  let type = 'general';
+  let data = null;
+  let groupId = null;
+  let groupName = payload.groupName || payload.group_name || '';
+
+  if (typeof text === 'string') {
+    const match = text.match(/^\[([A-Z_]+)\]:(.*)$/s);
+    if (match) {
+      const rawTag = match[1];
+      const payloadStr = match[2];
+      if (rawTag.startsWith('GROUP_')) {
+        type = rawTag.replace(/^GROUP_/, '').toLowerCase();
+      } else if (rawTag.includes('LOCATION_STOPPED')) {
+        type = 'location_stopped';
+      } else {
+        type = rawTag.toLowerCase();
+      }
+      try {
+        data = JSON.parse(payloadStr);
+      } catch {
+        data = { raw: payloadStr };
+      }
+      if (data && typeof data === 'object') {
+        groupId = data.groupId || null;
+        groupName = data.groupName || groupName;
+      }
+    }
+  }
+  if (!groupId && chatId && chatId.startsWith('group_')) {
+    groupId = chatId.replace(/^group_/, '');
+  }
+  return { type, data, groupId, groupName };
 }
 
 function parseNotificationPayload(text, chatId) {
@@ -243,28 +311,31 @@ function serializeRecord(doc) {
 async function saveIncomingPacket(payload) {
   const { chatId, senderId, senderName, receiverId, text, clientMessageId, replyTo } = payload;
   const isGroup = chatId && chatId.startsWith('group_');
-  const isNotif = isNotificationPacket(text) || payload.isNotification;
+  const isMassageNotif = isMassageNotificationPacket(text) || payload.isNotification;
 
-  if (!isGroup) {
-    // 1. Personal 1-on-1 direct message (including [GROUP_INVITE], [GROUP_INVITE_REJECTED], etc.)
-    const doc = await Message.create({
+  // 1. All notification packets (location share off, groups info in messages, etc.) -> massage_notification collection
+  if (isMassageNotif) {
+    const { type, data, groupId, groupName } = parseMassageNotification(text, chatId, payload);
+    const doc = await MassageNotification.create({
       chatId,
-      senderId,
+      type,
+      senderId: senderId || null,
       senderName: senderName || 'Unknown',
-      receiverId,
+      receiverId: receiverId || (isGroup ? 'all' : null),
+      groupId: groupId || (isGroup ? chatId.replace(/^group_/, '') : null),
+      groupName: groupName || '',
       text,
+      data,
       clientMessageId: clientMessageId || null,
-      replyTo: replyTo || null,
       deliveredAt: new Date(),
     });
 
-    // Also persist to GroupNotification if it's an invite packet for redundant lookup
-    if (isNotif) {
+    // Also persist to GroupNotification if it's a group room or group invite for backward compatibility
+    if (isGroup || type.includes('invite') || type.startsWith('member_')) {
       try {
-        const { type, data, groupId } = parseNotificationPayload(text, chatId);
         await GroupNotification.create({
           chatId,
-          groupId: groupId || 'none',
+          groupId: groupId || (isGroup ? chatId.replace(/^group_/, '') : 'none'),
           type,
           senderId: senderId || null,
           senderName: senderName || 'System',
@@ -276,31 +347,21 @@ async function saveIncomingPacket(payload) {
       } catch (e) {}
     }
 
-    return { record: serializeRecord(doc), category: 'message' };
-  } else if (isNotif) {
-    // 2. Group room notification / system packet
-    const { type, data, groupId } = parseNotificationPayload(text, chatId);
-    const doc = await GroupNotification.create({
-      chatId,
-      groupId: groupId || (isGroup ? chatId.replace(/^group_/, '') : 'none'),
-      type,
-      senderId: senderId || null,
-      senderName: senderName || 'System',
-      receiverId: receiverId || 'all',
-      text,
-      data,
-      clientMessageId: clientMessageId || null,
-    });
-    return { record: serializeRecord(doc), category: 'group_notification' };
-  } else if (isGroup) {
-    // 2. Save to group_massages collection
+    return { record: serializeRecord(doc), category: 'massage_notification' };
+  }
+
+  // 2. Group chat messages -> group_massages collection
+  if (isGroup) {
     const groupId = chatId.replace(/^group_/, '');
     let groupName = payload.groupName || payload.group_name || '';
 
-    // If groupName was not provided in the payload, look it up from group_notification
+    // If groupName was not provided in the payload, look it up from massage_notification or group_notification
     if (!groupName) {
       try {
-        const knownNotif = await GroupNotification.findOne({
+        const knownNotif = await MassageNotification.findOne({
+          groupId,
+          'data.groupName': { $exists: true, $ne: '' }
+        }).lean() || await GroupNotification.findOne({
           groupId,
           'data.groupName': { $exists: true, $ne: '' }
         }).lean();
@@ -322,20 +383,20 @@ async function saveIncomingPacket(payload) {
       deliveredAt: new Date(),
     });
     return { record: serializeRecord(doc), category: 'group_message' };
-  } else {
-    // 1. Save to messages collection (personal 1-on-1)
-    const doc = await Message.create({
-      chatId,
-      senderId,
-      senderName: senderName || 'Unknown',
-      receiverId,
-      text,
-      clientMessageId: clientMessageId || null,
-      replyTo: replyTo || null,
-      deliveredAt: new Date(),
-    });
-    return { record: serializeRecord(doc), category: 'message' };
   }
+
+  // 3. Regular 1-on-1 personal chat messages -> messages collection
+  const doc = await Message.create({
+    chatId,
+    senderId,
+    senderName: senderName || 'Unknown',
+    receiverId,
+    text,
+    clientMessageId: clientMessageId || null,
+    replyTo: replyTo || null,
+    deliveredAt: new Date(),
+  });
+  return { record: serializeRecord(doc), category: 'message' };
 }
 
 async function editMessageInDb({ chatId, messageId, clientMessageId, newText, senderId }) {
@@ -403,24 +464,33 @@ async function reactToMessageInDb({ chatId, messageId, clientMessageId, userId, 
 async function loadMessages(chatId, limit = 100) {
   const parsedLimit = Math.min(Math.max(parseInt(limit, 10) || 100, 1), 500);
   if (chatId.startsWith('group_')) {
-    // Return group chat messages and system announcements for GroupChatScreen history
-    const [groupMsgs, sysNotifs] = await Promise.all([
+    // Return group chat messages, massage_notifications, and system announcements for GroupChatScreen history
+    const [groupMsgs, sysNotifs, massageNotifs] = await Promise.all([
       GroupMessage.find({ chatId }).sort({ createdAt: -1 }).limit(parsedLimit).lean(),
       GroupNotification.find({ chatId, type: { $in: ['system', 'general'] } }).sort({ createdAt: -1 }).limit(parsedLimit).lean(),
+      MassageNotification.find({ chatId }).sort({ createdAt: -1 }).limit(parsedLimit).lean(),
     ]);
-    const combined = [...groupMsgs, ...sysNotifs]
-      .sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime())
-      .slice(-parsedLimit);
-    return combined.map(serializeRecord);
+    const seen = new Set();
+    const combined = [];
+    for (const item of [...groupMsgs, ...sysNotifs, ...massageNotifs]) {
+      const key = item.clientMessageId || String(item._id);
+      if (!seen.has(key)) {
+        seen.add(key);
+        combined.push(item);
+      }
+    }
+    combined.sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime());
+    return combined.slice(-parsedLimit).map(serializeRecord);
   } else {
-    // Personal 1-on-1 direct messages (include both Message and any existing GroupNotification records)
-    const [msgs, notifs] = await Promise.all([
+    // Personal 1-on-1 direct messages (include Message, MassageNotification, and GroupNotification)
+    const [msgs, massageNotifs, notifs] = await Promise.all([
       Message.find({ chatId }).sort({ createdAt: -1 }).limit(parsedLimit).lean(),
+      MassageNotification.find({ chatId }).sort({ createdAt: -1 }).limit(parsedLimit).lean(),
       GroupNotification.find({ chatId }).sort({ createdAt: -1 }).limit(parsedLimit).lean(),
     ]);
     const seen = new Set();
     const combined = [];
-    for (const item of [...msgs, ...notifs]) {
+    for (const item of [...msgs, ...massageNotifs, ...notifs]) {
       const key = item.clientMessageId || String(item._id);
       if (!seen.has(key)) {
         seen.add(key);
@@ -433,16 +503,34 @@ async function loadMessages(chatId, limit = 100) {
 }
 
 async function markConversationRead(chatId, readerId, readAt) {
+  if (!chatId || !readerId) return;
+  const ts = readAt || new Date();
   if (chatId.startsWith('group_')) {
-    await GroupMessage.updateMany(
-      { chatId, senderId: { $ne: readerId }, readAt: null },
-      { $set: { readAt } }
-    );
+    await Promise.all([
+      GroupMessage.updateMany(
+        { chatId, senderId: { $ne: readerId } },
+        { $set: { readAt: ts, status: 'read' } }
+      ),
+      MassageNotification.updateMany(
+        { chatId, senderId: { $ne: readerId } },
+        { $set: { readAt: ts, status: 'read' } }
+      ),
+    ]);
   } else {
-    await Message.updateMany(
-      { chatId, senderId: { $ne: readerId }, readAt: null },
-      { $set: { readAt } }
-    );
+    await Promise.all([
+      Message.updateMany(
+        { chatId, senderId: { $ne: readerId } },
+        { $set: { readAt: ts, status: 'read' } }
+      ),
+      MassageNotification.updateMany(
+        { chatId, senderId: { $ne: readerId } },
+        { $set: { readAt: ts, status: 'read' } }
+      ),
+      GroupNotification.updateMany(
+        { chatId, senderId: { $ne: readerId } },
+        { $set: { readAt: ts, status: 'read' } }
+      ),
+    ]);
   }
 }
 
@@ -678,11 +766,18 @@ async function main() {
       const userId = String(req.query.userId || '').trim();
       if (!userId) return res.status(400).json({ error: 'userId is required' });
 
-      // Find in messages collection and group_notification collection
-      const [inviteMsgs, notifs] = await Promise.all([
+      // Find in messages collection, massage_notification collection, and group_notification collection
+      const [inviteMsgs, massageNotifs, notifs] = await Promise.all([
         Message.find({
           receiverId: userId,
           text: { $regex: '^\\[GROUP_INVITE\\]:' }
+        }).sort({ createdAt: -1 }).limit(50).lean(),
+        MassageNotification.find({
+          receiverId: userId,
+          $or: [
+            { type: { $in: ['invite', 'group_invite'] } },
+            { text: { $regex: '^\\[GROUP_INVITE\\]:' } }
+          ]
         }).sort({ createdAt: -1 }).limit(50).lean(),
         GroupNotification.find({
           receiverId: userId,
@@ -693,8 +788,8 @@ async function main() {
       const invites = [];
       const seenGroupIds = new Set();
 
-      // Parse from inviteMsgs first (newest first)
-      for (const m of inviteMsgs) {
+      // Parse from inviteMsgs and massageNotifs first (newest first)
+      for (const m of [...inviteMsgs, ...massageNotifs]) {
         try {
           const inv = JSON.parse(m.text.replace('[GROUP_INVITE]:', ''));
           if (inv?.groupId && !seenGroupIds.has(inv.groupId)) {
@@ -732,6 +827,28 @@ async function main() {
     } catch (err) {
       console.error('GET /group-invites error:', err);
       res.status(500).json({ error: 'Unable to load group invites' });
+    }
+  });
+
+  // ── REST: load massage notifications strictly ──────────────────────────────
+  app.get('/massage-notifications', async (req, res) => {
+    try {
+      const chatId = String(req.query.chatId || (req.query.groupId ? `group_${req.query.groupId}` : '')).trim();
+      const userId = String(req.query.userId || '').trim();
+      const type = req.query.type ? String(req.query.type).trim() : null;
+      const limit = req.query.limit ? parseInt(req.query.limit, 10) : 100;
+      const parsedLimit = Math.min(Math.max(limit, 1), 500);
+
+      const filter = {};
+      if (chatId) filter.chatId = chatId;
+      if (userId) filter.receiverId = userId;
+      if (type) filter.type = type;
+
+      const notifs = await MassageNotification.find(filter).sort({ createdAt: -1 }).limit(parsedLimit).lean();
+      res.json(notifs.map(serializeRecord));
+    } catch (err) {
+      console.error('GET /massage-notifications error:', err);
+      res.status(500).json({ error: 'Unable to load massage notifications' });
     }
   });
 
@@ -807,17 +924,22 @@ async function main() {
       if (!chatId) return res.status(400).json({ error: 'chatId is required' });
 
       if (chatId.startsWith('group_')) {
-        const [delMsgs, delNotifs] = await Promise.all([
+        const [delMsgs, delNotifs, delMassageNotifs] = await Promise.all([
           GroupMessage.deleteMany({ chatId }),
           GroupNotification.deleteMany({ chatId }),
+          MassageNotification.deleteMany({ chatId }),
         ]);
-        const total = (delMsgs.deletedCount || 0) + (delNotifs.deletedCount || 0);
+        const total = (delMsgs.deletedCount || 0) + (delNotifs.deletedCount || 0) + (delMassageNotifs.deletedCount || 0);
         console.log(`[group] Deleted ${total} records for chatId=${chatId}`);
         res.json({ ok: true, deletedCount: total });
       } else {
-        const result = await Message.deleteMany({ chatId });
-        console.log(`[messages] Deleted ${result.deletedCount} messages for chatId=${chatId}`);
-        res.json({ ok: true, deletedCount: result.deletedCount });
+        const [delMsgs, delMassageNotifs] = await Promise.all([
+          Message.deleteMany({ chatId }),
+          MassageNotification.deleteMany({ chatId }),
+        ]);
+        const total = (delMsgs.deletedCount || 0) + (delMassageNotifs.deletedCount || 0);
+        console.log(`[messages] Deleted ${total} messages/notifications for chatId=${chatId}`);
+        res.json({ ok: true, deletedCount: total });
       }
     } catch (err) {
       console.error('DELETE /messages error:', err);
@@ -838,6 +960,24 @@ async function main() {
       const readAt = new Date();
       await markConversationRead(chatId, readerId, readAt);
       console.log(`[mark-read] chatId=${chatId} readerId=${readerId}`);
+
+      // Broadcast chat:read to everyone in the room!
+      io.to(chatId).emit('chat:read', {
+        chatId,
+        readerId,
+        readAt: readAt.toISOString(),
+      });
+
+      // Also forward to peer socket if peer is on another screen
+      for (const [sid, meta] of socketMeta.entries()) {
+        if (meta.userId !== readerId && meta.chatId !== chatId) {
+          const sock = io.sockets.sockets.get(sid);
+          if (sock) {
+            sock.emit('chat:read', { chatId, readerId, readAt: readAt.toISOString() });
+          }
+        }
+      }
+
       res.json({ ok: true });
     } catch (err) {
       console.error('POST /messages/mark-read error:', err);
@@ -935,6 +1075,18 @@ async function main() {
           isActive: peerOnline,
         });
         console.log(`[chat:join] Replying to ${uid}: peer ${otherUserId} isActive=${peerOnline}`);
+
+        // When joining a 1-to-1 chat, mark past messages as read immediately and notify peer
+        if (!roomId.startsWith('group_')) {
+          const readAt = new Date();
+          markConversationRead(roomId, uid, readAt).then(() => {
+            io.to(roomId).emit('chat:read', {
+              chatId: roomId,
+              readerId: uid,
+              readAt: readAt.toISOString(),
+            });
+          }).catch(() => {});
+        }
       }
     });
 
@@ -1001,12 +1153,21 @@ async function main() {
         if (!roomId || !readerId) return;
         const readAt = new Date();
         await markConversationRead(roomId, readerId, readAt);
-        socket.to(roomId).emit('chat:read', {
+        io.to(roomId).emit('chat:read', {
           chatId:     roomId,
           readerId,
           readerName: readerName || 'Reader',
-          readAt,
+          readAt:     readAt.toISOString(),
         });
+        // Also forward to background sockets of the peer
+        for (const [sid, meta] of socketMeta.entries()) {
+          if (meta.userId !== readerId && meta.chatId !== roomId) {
+            const sock = io.sockets.sockets.get(sid);
+            if (sock) {
+              sock.emit('chat:read', { chatId: roomId, readerId, readAt: readAt.toISOString() });
+            }
+          }
+        }
       } catch (err) {
         console.error('chat:read error:', err);
       }
