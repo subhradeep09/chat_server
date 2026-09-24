@@ -685,8 +685,8 @@ async function main() {
       }
 
       // Also push to receiver's background socket on ANY page (HomeScreen, Friends, etc.)
+      const sentUserIds = new Set();
       if (receiverId && receiverId !== 'all') {
-        const sentUserIds = new Set();
         for (const [sid, meta] of socketMeta.entries()) {
           if (meta.userId === receiverId && meta.chatId !== chatId && !sentUserIds.has(meta.userId)) {
             const destSock = io.sockets.sockets.get(sid);
@@ -694,6 +694,21 @@ async function main() {
               destSock.emit('message:new', record);
               sentUserIds.add(meta.userId);
               console.log(`[POST /messages] Forwarded message:new to receiver socket sid=${sid} (mode=${meta.mode})`);
+            }
+          }
+        }
+      }
+
+      // If a member was kicked from a group, ensure the kicked member's background socket receives it even if not currently in the group room
+      const kickedUserId = record.data?.targetUserId || record.data?.kickedUserId;
+      if (kickedUserId && !sentUserIds.has(kickedUserId)) {
+        for (const [sid, meta] of socketMeta.entries()) {
+          if (meta.userId === kickedUserId && meta.chatId !== chatId && !sentUserIds.has(meta.userId)) {
+            const destSock = io.sockets.sockets.get(sid);
+            if (destSock) {
+              destSock.emit('message:new', record);
+              sentUserIds.add(meta.userId);
+              console.log(`[POST /messages] Forwarded member_kicked to kicked user socket sid=${sid} (mode=${meta.mode})`);
             }
           }
         }
@@ -1223,8 +1238,8 @@ async function main() {
         }
 
         // ── In-app toast: find receiver's socket and emit directly on ANY page ──
+        const sentUserIds = new Set();
         if (receiverId && receiverId !== 'all') {
-          const sentUserIds = new Set();
           for (const [sid, meta] of socketMeta.entries()) {
             if (meta.userId === receiverId && meta.chatId !== roomId && !sentUserIds.has(meta.userId)) {
               const bgSock = io.sockets.sockets.get(sid);
@@ -1232,6 +1247,21 @@ async function main() {
                 bgSock.emit('message:new', record);
                 sentUserIds.add(meta.userId);
                 console.log(`[toast] Sent message:new to receiver socket of userId=${receiverId} (mode=${meta.mode})`);
+              }
+            }
+          }
+        }
+
+        // If member was kicked from a group, ensure the kicked member receives it via their background socket
+        const kickedUserId = record.data?.targetUserId || record.data?.kickedUserId;
+        if (kickedUserId && !sentUserIds.has(kickedUserId)) {
+          for (const [sid, meta] of socketMeta.entries()) {
+            if (meta.userId === kickedUserId && meta.chatId !== roomId && !sentUserIds.has(meta.userId)) {
+              const bgSock = io.sockets.sockets.get(sid);
+              if (bgSock) {
+                bgSock.emit('message:new', record);
+                sentUserIds.add(meta.userId);
+                console.log(`[toast] Sent message:new (member_kicked) to kicked user socket sid=${sid}`);
               }
             }
           }
