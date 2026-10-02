@@ -7,11 +7,14 @@ const mongoose = require('mongoose');
 const { Server } = require('socket.io');
 const admin = require('firebase-admin');
 
-dotenv.config({ path: path.resolve(__dirname, '..', '.env') });
+dotenv.config();
+if (!process.env.MONGODB_URI) {
+  dotenv.config({ path: path.resolve(__dirname, '..', '.env') });
+}
 
 const PORT         = process.env.PORT || process.env.CHAT_SERVER_PORT || 3001;
 const MONGODB_URI  = process.env.MONGODB_URI;
-const MONGODB_DB   = process.env.MONGODB_DB || 'puja_chat';
+const MONGODB_DB   = process.env.MONGODB_DB || 'chat_puja';
 const CLIENT_ORIGIN = process.env.CHAT_CLIENT_ORIGIN || '*';
 
 // ─── Firebase Admin (FCM) setup ───────────────────────────────────────────────
@@ -140,7 +143,8 @@ const groupNotificationSchema = new mongoose.Schema(
   {
     chatId:          { type: String, required: true, index: true },
     groupId:         { type: String, required: true, index: true },
-    type:            { type: String, required: true, index: true }, // 'system' | 'invite' | 'invite_accepted' | 'invite_rejected' | 'member_sync' | 'member_left' | 'member_kicked' | 'location' | 'location_stopped'
+    groupName:       { type: String, default: '' },
+    type:            { type: String, required: true, index: true }, // 'system' | 'invite' | 'invite_accepted' | 'invite_rejected' | 'member_sync' | 'member_left' | 'member_kicked' | 'location' | 'location_stopped' | 'name_updated'
     senderId:        { type: String, default: null },
     senderName:      { type: String, default: null },
     receiverId:      { type: String, default: 'all' },
@@ -152,6 +156,13 @@ const groupNotificationSchema = new mongoose.Schema(
 );
 groupNotificationSchema.index({ chatId: 1, createdAt: -1 });
 groupNotificationSchema.index({ groupId: 1, type: 1 });
+groupNotificationSchema.index({ type: 1, 'data.targetUserId': 1 });
+groupNotificationSchema.index({ type: 1, 'data.kickedUserId': 1 });
+// TTL index: auto-delete ephemeral group live location coordinate updates after 24 hours (86400s)
+groupNotificationSchema.index(
+  { createdAt: 1 },
+  { expireAfterSeconds: 86400, partialFilterExpression: { type: { $in: ['location', 'location_stopped'] } } }
+);
 const GroupNotification = mongoose.model('GroupNotification', groupNotificationSchema);
 
 // ── 4. massage_notification collection (Message & 1-on-1 Notifications / System Events) ──
@@ -176,6 +187,11 @@ const massageNotificationSchema = new mongoose.Schema(
 massageNotificationSchema.index({ chatId: 1, createdAt: -1 });
 massageNotificationSchema.index({ receiverId: 1, type: 1 });
 massageNotificationSchema.index({ groupId: 1, createdAt: -1 });
+// TTL index: auto-delete ephemeral 1-on-1 live location coordinate updates after 24 hours (86400s)
+massageNotificationSchema.index(
+  { createdAt: 1 },
+  { expireAfterSeconds: 86400, partialFilterExpression: { type: { $in: ['live_location', 'live_location_stopped', 'location_stopped'] } } }
+);
 const MassageNotification = mongoose.model('MassageNotification', massageNotificationSchema);
 
 // ── 4. notifytoken collection ──
@@ -215,24 +231,79 @@ async function deletePushToken(userId) {
 
 // ── Helpers for packet classification & serialization ──
 
-function isNotificationPacket(text) {
-  if (!text) return false;
-  return typeof text === 'string' && text.startsWith('[GROUP_');
-}
-
-function isMassageNotificationPacket(text) {
+function isGroupNotificationPacket(text, isNotificationFlag = false) {
+  if (isNotificationFlag) return true;
   if (!text || typeof text !== 'string') return false;
   return (
-    text.startsWith('[GROUP_') ||
-    text.startsWith('[LIVE_LOCATION_STOPPED]:') ||
-    text.startsWith('[LOCATION_STOPPED]:')
+    text.startsWith('[GROUP_LOCATION]:') ||
+    text.startsWith('[GROUP_LOCATION_STOPPED]:') ||
+    text.startsWith('[GROUP_MEMBER_SYNC]:') ||
+    text.startsWith('[GROUP_MEMBER_LEFT]:') ||
+    text.startsWith('[GROUP_MEMBER_KICKED]:') ||
+    text.startsWith('[GROUP_NAME_UPDATED]:') ||
+    text.startsWith('[GROUP_SYSTEM]:') ||
+    text.startsWith('[GROUP_')
   );
+}
+
+function isPersonalNotificationPacket(text, isNotificationFlag = false) {
+  if (isNotificationFlag) return true;
+  if (!text || typeof text !== 'string') return false;
+  return (
+    text.startsWith('[LIVE_LOCATION]:') ||
+    text.startsWith('[LIVE_LOCATION_STOPPED]:') ||
+    text.startsWith('[LOCATION_STOPPED]:') ||
+    text.startsWith('[GROUP_INVITE]:') ||
+    text.startsWith('[GROUP_INVITE_ACCEPTED]:') ||
+    text.startsWith('[GROUP_INVITE_REJECTED]:')
+  );
+}
+
+function parseGroupNotification(text, chatId, payload = {}) {
+  let type = 'general';
+  let data = null;
+  let groupId = (chatId && chatId.startsWith('group_')) ? chatId.replace(/^group_/, '') : (payload.groupId || null);
+  let groupName = payload.groupName || payload.group_name || '';
+
+  if (typeof text === 'string') {
+    const match = text.match(/^\[(GROUP_[A-Z_]+)\]:(.*)$/s);
+    if (match) {
+      const rawTag = match[1];
+      const payloadStr = match[2];
+      type = rawTag.replace(/^GROUP_/, '').toLowerCase();
+      try {
+        data = JSON.parse(payloadStr);
+      } catch {
+        data = { raw: payloadStr };
+      }
+      if (data && typeof data === 'object') {
+        if (data.groupId) groupId = data.groupId;
+        if (data.groupName) groupName = data.groupName;
+      }
+    } else {
+      const genericMatch = text.match(/^\[([A-Z_]+)\]:(.*)$/s);
+      if (genericMatch) {
+        type = genericMatch[1].toLowerCase();
+        try {
+          data = JSON.parse(genericMatch[2]);
+        } catch {
+          data = { raw: genericMatch[2] };
+        }
+        if (data && typeof data === 'object') {
+          if (data.groupId) groupId = data.groupId;
+          if (data.groupName) groupName = data.groupName;
+        }
+      }
+    }
+  }
+
+  return { type, data, groupId, groupName };
 }
 
 function parseMassageNotification(text, chatId, payload = {}) {
   let type = 'general';
   let data = null;
-  let groupId = null;
+  let groupId = payload.groupId || null;
   let groupName = payload.groupName || payload.group_name || '';
 
   if (typeof text === 'string') {
@@ -240,10 +311,16 @@ function parseMassageNotification(text, chatId, payload = {}) {
     if (match) {
       const rawTag = match[1];
       const payloadStr = match[2];
-      if (rawTag.startsWith('GROUP_')) {
-        type = rawTag.replace(/^GROUP_/, '').toLowerCase();
+      if (rawTag === 'LIVE_LOCATION') {
+        type = 'live_location';
       } else if (rawTag.includes('LOCATION_STOPPED')) {
-        type = 'location_stopped';
+        type = 'live_location_stopped';
+      } else if (rawTag === 'GROUP_INVITE') {
+        type = 'invite';
+      } else if (rawTag === 'GROUP_INVITE_ACCEPTED') {
+        type = 'invite_accepted';
+      } else if (rawTag === 'GROUP_INVITE_REJECTED') {
+        type = 'invite_rejected';
       } else {
         type = rawTag.toLowerCase();
       }
@@ -253,36 +330,13 @@ function parseMassageNotification(text, chatId, payload = {}) {
         data = { raw: payloadStr };
       }
       if (data && typeof data === 'object') {
-        groupId = data.groupId || null;
-        groupName = data.groupName || groupName;
+        if (data.groupId) groupId = data.groupId;
+        if (data.groupName) groupName = data.groupName;
       }
     }
   }
-  if (!groupId && chatId && chatId.startsWith('group_')) {
-    groupId = chatId.replace(/^group_/, '');
-  }
+
   return { type, data, groupId, groupName };
-}
-
-function parseNotificationPayload(text, chatId) {
-  let type = 'general';
-  let data = null;
-  const match = typeof text === 'string' ? text.match(/^\[(GROUP_[A-Z_]+)\]:(.*)$/s) : null;
-  if (match) {
-    const rawTag = match[1];
-    const payloadStr = match[2];
-    type = rawTag.replace(/^GROUP_/, '').toLowerCase();
-    try {
-      data = JSON.parse(payloadStr);
-    } catch {
-      data = { raw: payloadStr };
-    }
-  }
-  const groupId = (chatId && chatId.startsWith('group_'))
-    ? chatId.replace(/^group_/, '')
-    : (data?.groupId || null);
-
-  return { type, data, groupId };
 }
 
 function serializeRecord(doc) {
@@ -310,42 +364,24 @@ function serializeRecord(doc) {
 
 async function saveIncomingPacket(payload) {
   const { chatId, senderId, senderName, receiverId, text, clientMessageId, replyTo } = payload;
-  const isGroup = chatId && chatId.startsWith('group_');
-  const isMassageNotif = isMassageNotificationPacket(text) || payload.isNotification;
+  const isGroup = Boolean(chatId && chatId.startsWith('group_'));
 
-  // 1. All notification packets (location share off, groups info in messages, etc.) -> massage_notification collection
-  if (isMassageNotif) {
-    const { type, data, groupId, groupName } = parseMassageNotification(text, chatId, payload);
-    const doc = await MassageNotification.create({
+  // ── 1. GROUP NOTIFICATION -> group_notification collection ──
+  // All group events: member join, group live location, rename, kick, left, system
+  if (isGroup && isGroupNotificationPacket(text, payload.isNotification)) {
+    const { type, data, groupId, groupName } = parseGroupNotification(text, chatId, payload);
+    const doc = await GroupNotification.create({
       chatId,
+      groupId: groupId || chatId.replace(/^group_/, ''),
+      groupName: groupName || '',
       type,
       senderId: senderId || null,
-      senderName: senderName || 'Unknown',
-      receiverId: receiverId || (isGroup ? 'all' : null),
-      groupId: groupId || (isGroup ? chatId.replace(/^group_/, '') : null),
-      groupName: groupName || '',
+      senderName: senderName || 'System',
+      receiverId: receiverId || 'all',
       text,
       data,
       clientMessageId: clientMessageId || null,
-      deliveredAt: new Date(),
     });
-
-    // Only persist to GroupNotification if it's an actual group room (starts with group_)
-    if (isGroup) {
-      try {
-        await GroupNotification.create({
-          chatId,
-          groupId: groupId || chatId.replace(/^group_/, ''),
-          type,
-          senderId: senderId || null,
-          senderName: senderName || 'System',
-          receiverId: receiverId || 'all',
-          text,
-          data,
-          clientMessageId: clientMessageId || null,
-        });
-      } catch (e) {}
-    }
 
     // If a member was kicked, purge any old group invite messages for that user & group
     if (type === 'member_kicked') {
@@ -380,25 +416,46 @@ async function saveIncomingPacket(payload) {
       }
     }
 
+    return { record: serializeRecord(doc), category: 'group_notification' };
+  }
+
+  // ── 2. PERSONAL NOTIFICATION -> massage_notification collection ──
+  // 1-on-1 notifications: live location share, live location stop, group invites / status in direct messages
+  if (!isGroup && isPersonalNotificationPacket(text, payload.isNotification)) {
+    const { type, data, groupId, groupName } = parseMassageNotification(text, chatId, payload);
+    const doc = await MassageNotification.create({
+      chatId,
+      type,
+      senderId: senderId || null,
+      senderName: senderName || 'Unknown',
+      receiverId: receiverId || null,
+      groupId: groupId || null,
+      groupName: groupName || '',
+      text,
+      data,
+      clientMessageId: clientMessageId || null,
+      deliveredAt: new Date(),
+    });
+
     return { record: serializeRecord(doc), category: 'massage_notification' };
   }
 
-  // 2. Group chat messages -> group_massages collection
+  // ── 3. GROUP CHAT MESSAGE -> group_massages collection ──
+  // Pure group text messages ONLY
   if (isGroup) {
     const groupId = chatId.replace(/^group_/, '');
     let groupName = payload.groupName || payload.group_name || '';
 
-    // If groupName was not provided in the payload, look it up from massage_notification or group_notification
+    // If groupName was not provided in the payload, look it up from group_notification
     if (!groupName) {
       try {
-        const knownNotif = await MassageNotification.findOne({
+        const knownNotif = await GroupNotification.findOne({
           groupId,
-          'data.groupName': { $exists: true, $ne: '' }
-        }).lean() || await GroupNotification.findOne({
-          groupId,
-          'data.groupName': { $exists: true, $ne: '' }
+          groupName: { $exists: true, $ne: '' }
         }).lean();
-        if (knownNotif?.data?.groupName) {
+        if (knownNotif?.groupName) {
+          groupName = knownNotif.groupName;
+        } else if (knownNotif?.data?.groupName) {
           groupName = knownNotif.data.groupName;
         }
       } catch (e) {}
@@ -418,7 +475,8 @@ async function saveIncomingPacket(payload) {
     return { record: serializeRecord(doc), category: 'group_message' };
   }
 
-  // 3. Regular 1-on-1 personal chat messages -> messages collection
+  // ── 4. PERSONAL CHAT MESSAGE -> messages collection ──
+  // Pure 1-on-1 personal text messages ONLY
   const doc = await Message.create({
     chatId,
     senderId,
@@ -497,15 +555,14 @@ async function reactToMessageInDb({ chatId, messageId, clientMessageId, userId, 
 async function loadMessages(chatId, limit = 100) {
   const parsedLimit = Math.min(Math.max(parseInt(limit, 10) || 100, 1), 500);
   if (chatId.startsWith('group_')) {
-    // Return group chat messages, massage_notifications, and system announcements for GroupChatScreen history
-    const [groupMsgs, sysNotifs, massageNotifs] = await Promise.all([
+    // Return group chat messages and group notifications ONLY
+    const [groupMsgs, groupNotifs] = await Promise.all([
       GroupMessage.find({ chatId }).sort({ createdAt: -1 }).limit(parsedLimit).lean(),
-      GroupNotification.find({ chatId, type: { $in: ['system', 'general'] } }).sort({ createdAt: -1 }).limit(parsedLimit).lean(),
-      MassageNotification.find({ chatId }).sort({ createdAt: -1 }).limit(parsedLimit).lean(),
+      GroupNotification.find({ chatId }).sort({ createdAt: -1 }).limit(parsedLimit).lean(),
     ]);
     const seen = new Set();
     const combined = [];
-    for (const item of [...groupMsgs, ...sysNotifs, ...massageNotifs]) {
+    for (const item of [...groupMsgs, ...groupNotifs]) {
       const key = item.clientMessageId || String(item._id);
       if (!seen.has(key)) {
         seen.add(key);
@@ -515,11 +572,30 @@ async function loadMessages(chatId, limit = 100) {
     combined.sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime());
     return combined.slice(-parsedLimit).map(serializeRecord);
   } else {
-    // Personal 1-on-1 direct messages (include Message and MassageNotification)
+    // 1-on-1 direct messages: Determine the participant user IDs for this chat
+    const participants = new Set();
+    if (currentUserId) participants.add(currentUserId);
+    if (chatId && chatId.includes('_')) {
+      const parts = chatId.split('_');
+      parts.forEach((p) => { if (p) participants.add(p); });
+    }
+    const candidateUserIds = Array.from(participants).filter(Boolean);
+
+    // Build targeted query strictly for the participants of this conversation
+    const kickFilter = { type: 'member_kicked' };
+    if (candidateUserIds.length > 0) {
+      kickFilter.$or = [
+        { 'data.targetUserId': { $in: candidateUserIds } },
+        { 'data.kickedUserId': { $in: candidateUserIds } },
+        { receiverId: { $in: candidateUserIds } },
+      ];
+    }
+
+    // Personal 1-on-1 direct messages (Message and MassageNotification ONLY)
     const [msgs, massageNotifs, kickedNotifs] = await Promise.all([
       Message.find({ chatId }).sort({ createdAt: -1 }).limit(parsedLimit).lean(),
       MassageNotification.find({ chatId }).sort({ createdAt: -1 }).limit(parsedLimit).lean(),
-      MassageNotification.find({ type: 'member_kicked' }).sort({ createdAt: -1 }).limit(100).lean(),
+      GroupNotification.find(kickFilter).sort({ createdAt: -1 }).limit(50).lean(),
     ]);
 
     const kickedPairs = new Set();
@@ -538,7 +614,7 @@ async function loadMessages(chatId, limit = 100) {
         try {
           const inv = JSON.parse(item.text.replace('[GROUP_INVITE]:', ''));
           if (inv?.groupId) {
-            const targetUid = item.receiverId || inv.inviteeId;
+            const targetUid = item.receiverId || inv.inviteeId || inv.invitedUserId;
             if (targetUid && kickedPairs.has(`${inv.groupId}_${targetUid}`)) {
               // User was kicked from this group — never return this invite card
               continue;
@@ -564,16 +640,10 @@ async function markConversationRead(chatId, readerId, readAt) {
   if (!chatId || !readerId) return;
   const ts = readAt || new Date();
   if (chatId.startsWith('group_')) {
-    await Promise.all([
-      GroupMessage.updateMany(
-        { chatId, senderId: { $ne: readerId } },
-        { $set: { readAt: ts, status: 'read' } }
-      ),
-      MassageNotification.updateMany(
-        { chatId, senderId: { $ne: readerId } },
-        { $set: { readAt: ts, status: 'read' } }
-      ),
-    ]);
+    await GroupMessage.updateMany(
+      { chatId, senderId: { $ne: readerId } },
+      { $set: { readAt: ts, status: 'read' } }
+    );
   } else {
     await Promise.all([
       Message.updateMany(
@@ -581,10 +651,6 @@ async function markConversationRead(chatId, readerId, readAt) {
         { $set: { readAt: ts, status: 'read' } }
       ),
       MassageNotification.updateMany(
-        { chatId, senderId: { $ne: readerId } },
-        { $set: { readAt: ts, status: 'read' } }
-      ),
-      GroupNotification.updateMany(
         { chatId, senderId: { $ne: readerId } },
         { $set: { readAt: ts, status: 'read' } }
       ),
@@ -700,7 +766,8 @@ async function main() {
       const chatId = String(req.query.chatId || '').trim();
       if (!chatId) return res.status(400).json({ error: 'chatId is required' });
       const limit = req.query.limit ? parseInt(req.query.limit, 10) : 100;
-      res.json(await loadMessages(chatId, limit));
+      const userId = req.query.userId ? String(req.query.userId).trim() : null;
+      res.json(await loadMessages(chatId, limit, userId));
     } catch (err) {
       console.error('GET /messages error:', err);
       res.status(500).json({ error: 'Unable to load messages' });
@@ -729,6 +796,8 @@ async function main() {
         io.to(chatId).emit('group_message:new', record);
       } else if (category === 'group_notification') {
         io.to(chatId).emit('group_notification:new', record);
+      } else if (category === 'massage_notification') {
+        io.to(chatId).emit('massage_notification:new', record);
       }
 
       // Also push to receiver's background socket on ANY page (HomeScreen, Friends, etc.)
@@ -841,12 +910,9 @@ async function main() {
       const userId = String(req.query.userId || '').trim();
       if (!userId) return res.status(400).json({ error: 'userId is required' });
 
-      // Find in messages collection, massage_notification collection, and group_notification collection
-      const [inviteMsgs, massageNotifs, notifs, kickedNotifs] = await Promise.all([
-        Message.find({
-          receiverId: userId,
-          text: { $regex: '^\\[GROUP_INVITE\\]:' }
-        }).sort({ createdAt: -1 }).limit(50).lean(),
+      // Group invites are sent in 1-on-1 chats and stored in massage_notification
+      // Check kicked status in group_notification
+      const [massageNotifs, kickedNotifs] = await Promise.all([
         MassageNotification.find({
           receiverId: userId,
           $or: [
@@ -855,10 +921,6 @@ async function main() {
           ]
         }).sort({ createdAt: -1 }).limit(50).lean(),
         GroupNotification.find({
-          receiverId: userId,
-          type: 'invite'
-        }).sort({ createdAt: -1 }).limit(50).lean(),
-        MassageNotification.find({
           type: 'member_kicked',
           $or: [
             { 'data.targetUserId': userId },
@@ -871,8 +933,7 @@ async function main() {
       const invites = [];
       const seenGroupIds = new Set();
 
-      // Parse from inviteMsgs and massageNotifs first (newest first)
-      for (const m of [...inviteMsgs, ...massageNotifs]) {
+      for (const m of massageNotifs) {
         try {
           const inv = JSON.parse(m.text.replace('[GROUP_INVITE]:', ''));
           if (inv?.groupId && !kickedGroupIds.has(inv.groupId) && !seenGroupIds.has(inv.groupId)) {
@@ -888,24 +949,6 @@ async function main() {
         } catch {}
       }
 
-      // Also parse from notifs
-      for (const n of notifs) {
-        try {
-          let inv = n.data;
-          if (typeof inv === 'string') inv = JSON.parse(inv);
-          if (inv?.groupId && !kickedGroupIds.has(inv.groupId) && !seenGroupIds.has(inv.groupId)) {
-            seenGroupIds.add(inv.groupId);
-            invites.push({
-              ...inv,
-              status: inv.status || 'pending',
-              messageId: String(n._id),
-              clientMessageId: n.clientMessageId,
-              timestamp: n.createdAt || inv.timestamp,
-            });
-          }
-        } catch {}
-      }
-
       res.json(invites);
     } catch (err) {
       console.error('GET /group-invites error:', err);
@@ -913,17 +956,21 @@ async function main() {
     }
   });
 
-  // ── REST: load massage notifications strictly ──────────────────────────────
+  // ── REST: load massage notifications strictly (1-on-1 notifications) ───────
   app.get('/massage-notifications', async (req, res) => {
     try {
-      const chatId = String(req.query.chatId || (req.query.groupId ? `group_${req.query.groupId}` : '')).trim();
+      const chatId = String(req.query.chatId || '').trim();
       const userId = String(req.query.userId || '').trim();
       const type = req.query.type ? String(req.query.type).trim() : null;
       const limit = req.query.limit ? parseInt(req.query.limit, 10) : 100;
       const parsedLimit = Math.min(Math.max(limit, 1), 500);
 
       const filter = {};
-      if (chatId) filter.chatId = chatId;
+      if (chatId) {
+        filter.chatId = chatId;
+      } else {
+        filter.chatId = { $not: { $regex: '^group_' } };
+      }
       if (userId) filter.receiverId = userId;
       if (type) filter.type = type;
 
@@ -1007,12 +1054,11 @@ async function main() {
       if (!chatId) return res.status(400).json({ error: 'chatId is required' });
 
       if (chatId.startsWith('group_')) {
-        const [delMsgs, delNotifs, delMassageNotifs] = await Promise.all([
+        const [delMsgs, delNotifs] = await Promise.all([
           GroupMessage.deleteMany({ chatId }),
           GroupNotification.deleteMany({ chatId }),
-          MassageNotification.deleteMany({ chatId }),
         ]);
-        const total = (delMsgs.deletedCount || 0) + (delNotifs.deletedCount || 0) + (delMassageNotifs.deletedCount || 0);
+        const total = (delMsgs.deletedCount || 0) + (delNotifs.deletedCount || 0);
         console.log(`[group] Deleted ${total} records for chatId=${chatId}`);
         res.json({ ok: true, deletedCount: total });
       } else {
@@ -1290,6 +1336,8 @@ async function main() {
           io.to(roomId).emit('group_message:new', record);
         } else if (category === 'group_notification') {
           io.to(roomId).emit('group_notification:new', record);
+        } else if (category === 'massage_notification') {
+          io.to(roomId).emit('massage_notification:new', record);
         }
 
         // ── In-app toast: find receiver's socket and emit directly on ANY page ──
