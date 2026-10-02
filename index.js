@@ -552,7 +552,7 @@ async function reactToMessageInDb({ chatId, messageId, clientMessageId, userId, 
   return serializeRecord(doc);
 }
 
-async function loadMessages(chatId, limit = 100) {
+async function loadMessages(chatId, limit = 100, currentUserId = null) {
   const parsedLimit = Math.min(Math.max(parseInt(limit, 10) || 100, 1), 500);
   if (chatId.startsWith('group_')) {
     // Return group chat messages and group notifications ONLY
