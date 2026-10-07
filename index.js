@@ -552,7 +552,7 @@ async function reactToMessageInDb({ chatId, messageId, clientMessageId, userId, 
   return serializeRecord(doc);
 }
 
-async function loadMessages(chatId, limit = 100) {
+async function loadMessages(chatId, limit = 100, currentUserId = null) {
   const parsedLimit = Math.min(Math.max(parseInt(limit, 10) || 100, 1), 500);
   if (chatId.startsWith('group_')) {
     // Return group chat messages and group notifications ONLY
@@ -801,14 +801,14 @@ async function main() {
       }
 
       // Also push to receiver's background socket on ANY page (HomeScreen, Friends, etc.)
-      const sentUserIds = new Set();
+      const sentSocketIds = new Set();
       if (receiverId && receiverId !== 'all') {
         for (const [sid, meta] of socketMeta.entries()) {
-          if (meta.userId === receiverId && meta.chatId !== chatId && !sentUserIds.has(meta.userId)) {
+          if (meta.userId === receiverId && meta.chatId !== chatId && !sentSocketIds.has(sid)) {
             const destSock = io.sockets.sockets.get(sid);
             if (destSock) {
               destSock.emit('message:new', record);
-              sentUserIds.add(meta.userId);
+              sentSocketIds.add(sid);
               console.log(`[POST /messages] Forwarded message:new to receiver socket sid=${sid} (mode=${meta.mode})`);
             }
           }
@@ -817,13 +817,13 @@ async function main() {
 
       // If a member was kicked from a group, ensure the kicked member's background socket receives it even if not currently in the group room
       const kickedUserId = record.data?.targetUserId || record.data?.kickedUserId;
-      if (kickedUserId && !sentUserIds.has(kickedUserId)) {
+      if (kickedUserId) {
         for (const [sid, meta] of socketMeta.entries()) {
-          if (meta.userId === kickedUserId && meta.chatId !== chatId && !sentUserIds.has(meta.userId)) {
+          if (meta.userId === kickedUserId && meta.chatId !== chatId && !sentSocketIds.has(sid)) {
             const destSock = io.sockets.sockets.get(sid);
             if (destSock) {
               destSock.emit('message:new', record);
-              sentUserIds.add(meta.userId);
+              sentSocketIds.add(sid);
               console.log(`[POST /messages] Forwarded member_kicked to kicked user socket sid=${sid} (mode=${meta.mode})`);
             }
           }
@@ -1097,9 +1097,9 @@ async function main() {
         readAt: readAt.toISOString(),
       });
 
-      // Also forward to peer socket if peer is on another screen
+      // Also forward to peer socket or reader socket on another screen
       for (const [sid, meta] of socketMeta.entries()) {
-        if (meta.userId !== readerId && meta.chatId !== chatId) {
+        if (meta.chatId !== chatId) {
           const sock = io.sockets.sockets.get(sid);
           if (sock) {
             sock.emit('chat:read', { chatId, readerId, readAt: readAt.toISOString() });
@@ -1288,9 +1288,9 @@ async function main() {
           readerName: readerName || 'Reader',
           readAt:     readAt.toISOString(),
         });
-        // Also forward to background sockets of the peer
+        // Also forward to background/other sockets outside the room
         for (const [sid, meta] of socketMeta.entries()) {
-          if (meta.userId !== readerId && meta.chatId !== roomId) {
+          if (meta.chatId !== roomId) {
             const sock = io.sockets.sockets.get(sid);
             if (sock) {
               sock.emit('chat:read', { chatId: roomId, readerId, readAt: readAt.toISOString() });
@@ -1341,15 +1341,15 @@ async function main() {
         }
 
         // ── In-app toast: find receiver's socket and emit directly on ANY page ──
-        const sentUserIds = new Set();
+        const sentSocketIds = new Set();
         if (receiverId && receiverId !== 'all') {
           for (const [sid, meta] of socketMeta.entries()) {
-            if (meta.userId === receiverId && meta.chatId !== roomId && !sentUserIds.has(meta.userId)) {
+            if (meta.userId === receiverId && meta.chatId !== roomId && !sentSocketIds.has(sid)) {
               const bgSock = io.sockets.sockets.get(sid);
               if (bgSock) {
                 bgSock.emit('message:new', record);
-                sentUserIds.add(meta.userId);
-                console.log(`[toast] Sent message:new to receiver socket of userId=${receiverId} (mode=${meta.mode})`);
+                sentSocketIds.add(sid);
+                console.log(`[toast] Sent message:new to receiver socket of userId=${receiverId} (sid=${sid}, mode=${meta.mode})`);
               }
             }
           }
@@ -1357,13 +1357,13 @@ async function main() {
 
         // If member was kicked from a group, ensure the kicked member receives it via their background socket
         const kickedUserId = record.data?.targetUserId || record.data?.kickedUserId;
-        if (kickedUserId && !sentUserIds.has(kickedUserId)) {
+        if (kickedUserId) {
           for (const [sid, meta] of socketMeta.entries()) {
-            if (meta.userId === kickedUserId && meta.chatId !== roomId && !sentUserIds.has(meta.userId)) {
+            if (meta.userId === kickedUserId && meta.chatId !== roomId && !sentSocketIds.has(sid)) {
               const bgSock = io.sockets.sockets.get(sid);
               if (bgSock) {
                 bgSock.emit('message:new', record);
-                sentUserIds.add(meta.userId);
+                sentSocketIds.add(sid);
                 console.log(`[toast] Sent message:new (member_kicked) to kicked user socket sid=${sid}`);
               }
             }
@@ -1371,17 +1371,30 @@ async function main() {
         }
 
         // ── Send FCM push notification (mobile system tray) via firebase-admin ─────
-        if (category === 'message' && receiverId) {
+        if ((category === 'message' || category === 'massage_notification') && receiverId) {
           const receiverMeta = userPresence.get(receiverId);
           const receiverInRoom = receiverMeta?.chatId === roomId && receiverMeta?.isActive;
           if (!receiverInRoom) {
-            const fcmToken = await getPushToken(receiverId);
-            await sendFCMNotification(
-              fcmToken,
-              senderName || 'New message',
-              text.length > 100 ? text.slice(0, 97) + '…' : text,
-              { otherUserId: senderId, senderName: senderName || 'Someone', chatId: roomId }
-            );
+            let pushBody = text || '';
+            if (pushBody.startsWith('[LIVE_LOCATION]:') || pushBody.startsWith('[GROUP_LOCATION]:')) {
+              pushBody = '📍 Shared live location';
+            } else if (
+              pushBody.startsWith('[LIVE_LOCATION_STOPPED]:') ||
+              pushBody.startsWith('[GROUP_LOCATION_STOPPED]:') ||
+              pushBody.startsWith('[LOCATION_STOPPED]:')
+            ) {
+              pushBody = 'Stopped sharing live location';
+            }
+
+            if (pushBody && !pushBody.startsWith('[')) {
+              const fcmToken = await getPushToken(receiverId);
+              await sendFCMNotification(
+                fcmToken,
+                senderName || 'New message',
+                pushBody.length > 100 ? pushBody.slice(0, 97) + '…' : pushBody,
+                { otherUserId: senderId, senderName: senderName || 'Someone', chatId: roomId }
+              );
+            }
           }
         }
 
