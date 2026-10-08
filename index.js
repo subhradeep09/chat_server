@@ -91,6 +91,28 @@ if (/atlas-sql|\.query\.mongodb\.net/i.test(MONGODB_URI)) {
   process.exit(1);
 }
 
+// ─── IST (Indian Standard Time, UTC+5:30) Helpers ───────────────────────────
+const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
+
+function getISTDate(date) {
+  const d = (date instanceof Date && !isNaN(date.getTime()))
+    ? date
+    : (typeof date === 'number' || (typeof date === 'string' && !isNaN(new Date(date).getTime()))
+        ? new Date(date)
+        : new Date());
+  return new Date(d.getTime() + IST_OFFSET_MS);
+}
+
+function getISTString(date) {
+  const d = (date instanceof Date && !isNaN(date.getTime()))
+    ? date
+    : (typeof date === 'number' || (typeof date === 'string' && !isNaN(new Date(date).getTime()))
+        ? new Date(date)
+        : new Date());
+  const ist = new Date(d.getTime() + IST_OFFSET_MS);
+  return ist.toISOString().replace('Z', '+05:30');
+}
+
 // ─── Mongoose schemas ─────────────────────────────────────────────────────────
 
 // ── 1. messages collection (Personal 1-on-1 Messages) ──
@@ -102,14 +124,16 @@ const messageSchema = new mongoose.Schema(
     receiverId:      { type: String, required: true, index: true },
     text:            { type: String, required: true, trim: true },
     clientMessageId: { type: String, default: null, index: true },
-    deliveredAt:     { type: Date, default: Date.now },
+    deliveredAt:     { type: Date, default: getISTDate },
+    createdAt:       { type: Date, default: getISTDate },
+    istTime:         { type: String, default: getISTString },
     readAt:          { type: Date, default: null },
     replyTo:         { type: mongoose.Schema.Types.Mixed, default: null },
     isEdited:        { type: Boolean, default: false },
     editedAt:        { type: Date, default: null },
     reactions:       { type: Array, default: [] },
   },
-  { timestamps: { createdAt: true, updatedAt: false }, versionKey: false, collection: 'messages' }
+  { timestamps: false, versionKey: false, collection: 'messages' }
 );
 messageSchema.index({ chatId: 1, createdAt: 1 });
 messageSchema.index({ chatId: 1, createdAt: -1 });
@@ -125,14 +149,16 @@ const groupMessageSchema = new mongoose.Schema(
     senderName:      { type: String, required: true },
     text:            { type: String, required: true, trim: true },
     clientMessageId: { type: String, default: null, index: true },
-    deliveredAt:     { type: Date, default: Date.now },
+    deliveredAt:     { type: Date, default: getISTDate },
+    createdAt:       { type: Date, default: getISTDate },
+    istTime:         { type: String, default: getISTString },
     readAt:          { type: Date, default: null },
     replyTo:         { type: mongoose.Schema.Types.Mixed, default: null },
     isEdited:        { type: Boolean, default: false },
     editedAt:        { type: Date, default: null },
     reactions:       { type: Array, default: [] },
   },
-  { timestamps: { createdAt: true, updatedAt: false }, versionKey: false, collection: 'group_massages' }
+  { timestamps: false, versionKey: false, collection: 'group_massages' }
 );
 groupMessageSchema.index({ chatId: 1, createdAt: 1 });
 groupMessageSchema.index({ groupId: 1, createdAt: -1 });
@@ -151,8 +177,11 @@ const groupNotificationSchema = new mongoose.Schema(
     text:            { type: String, required: true },
     data:            { type: mongoose.Schema.Types.Mixed, default: null },
     clientMessageId: { type: String, default: null, index: true },
+    deliveredAt:     { type: Date, default: getISTDate },
+    createdAt:       { type: Date, default: getISTDate },
+    istTime:         { type: String, default: getISTString },
   },
-  { timestamps: { createdAt: true, updatedAt: false }, versionKey: false, collection: 'group_notification' }
+  { timestamps: false, versionKey: false, collection: 'group_notification' }
 );
 groupNotificationSchema.index({ chatId: 1, createdAt: -1 });
 groupNotificationSchema.index({ groupId: 1, type: 1 });
@@ -179,10 +208,12 @@ const massageNotificationSchema = new mongoose.Schema(
     text:            { type: String, required: true },
     data:            { type: mongoose.Schema.Types.Mixed, default: null },
     clientMessageId: { type: String, default: null, index: true },
-    deliveredAt:     { type: Date, default: Date.now },
+    deliveredAt:     { type: Date, default: getISTDate },
+    createdAt:       { type: Date, default: getISTDate },
+    istTime:         { type: String, default: getISTString },
     readAt:          { type: Date, default: null },
   },
-  { timestamps: { createdAt: true, updatedAt: false }, versionKey: false, collection: 'massage_notification' }
+  { timestamps: false, versionKey: false, collection: 'massage_notification' }
 );
 massageNotificationSchema.index({ chatId: 1, createdAt: -1 });
 massageNotificationSchema.index({ receiverId: 1, type: 1 });
@@ -200,10 +231,13 @@ const MassageNotification = mongoose.model('MassageNotification', massageNotific
 // Survives server restarts unlike the old in-memory Map.
 const notifyTokenSchema = new mongoose.Schema(
   {
-    userId: { type: String, required: true, unique: true, index: true },
-    token:  { type: String, required: true },
+    userId:    { type: String, required: true, unique: true, index: true },
+    token:     { type: String, required: true },
+    createdAt: { type: Date, default: getISTDate },
+    updatedAt: { type: Date, default: getISTDate },
+    istTime:   { type: String, default: getISTString },
   },
-  { timestamps: { createdAt: true, updatedAt: true }, versionKey: false, collection: 'notifytoken' }
+  { timestamps: false, versionKey: false, collection: 'notifytoken' }
 );
 const NotifyToken = mongoose.model('NotifyToken', notifyTokenSchema);
 
@@ -213,7 +247,10 @@ const NotifyToken = mongoose.model('NotifyToken', notifyTokenSchema);
 async function savePushToken(userId, token) {
   await NotifyToken.findOneAndUpdate(
     { userId },
-    { userId, token },
+    {
+      $set: { userId, token, updatedAt: getISTDate(), istTime: getISTString() },
+      $setOnInsert: { createdAt: getISTDate() },
+    },
     { upsert: true, new: true, setDefaultsOnInsert: true }
   );
 }
@@ -229,7 +266,22 @@ async function deletePushToken(userId) {
   await NotifyToken.deleteOne({ userId });
 }
 
-// ── 5. groups collection (Group Metadata & Membership) ──
+// ── 5. user_profiles collection (User Google Photos & Avatars) ──
+const userProfileSchema = new mongoose.Schema(
+  {
+    userId:    { type: String, required: true, unique: true, index: true },
+    userName:  { type: String, default: '' },
+    photo:     { type: String, default: null },
+    avatar_id: { type: String, default: 'google' },
+    createdAt: { type: Date, default: getISTDate },
+    updatedAt: { type: Date, default: getISTDate },
+    istTime:   { type: String, default: getISTString },
+  },
+  { timestamps: false, versionKey: false, collection: 'user_profiles' }
+);
+const UserProfile = mongoose.model('UserProfile', userProfileSchema);
+
+// ── 6. groups collection (Group Metadata & Membership) ──
 const groupMemberSubSchema = new mongoose.Schema(
   {
     id:        { type: String, required: true },
@@ -237,7 +289,7 @@ const groupMemberSubSchema = new mongoose.Schema(
     avatar_id: { type: mongoose.Schema.Types.Mixed, default: '1' },
     photo:     { type: String, default: null },
     role:      { type: String, enum: ['admin', 'member'], default: 'member' },
-    joinedAt:  { type: String, default: () => new Date().toISOString() },
+    joinedAt:  { type: String, default: getISTString },
   },
   { _id: false }
 );
@@ -249,18 +301,47 @@ const groupSchema = new mongoose.Schema(
     description:     { type: String, default: '' },
     createdBy:       { type: String, required: true, index: true },
     createdByName:   { type: String, default: '' },
-    createdAt:       { type: String, default: () => new Date().toISOString() },
+    createdAt:       { type: String, default: getISTString },
+    createdAtDate:   { type: Date, default: getISTDate },
+    updatedAtDate:   { type: Date, default: getISTDate },
+    istTime:         { type: String, default: getISTString },
     members:         { type: [groupMemberSubSchema], default: [] },
     icon:            { type: String, default: 'friends' },
     lastMessage:     { type: String, default: 'Group created' },
-    lastMessageTime: { type: String, default: () => new Date().toISOString() },
+    lastMessageTime: { type: String, default: getISTString },
     isDeleted:       { type: Boolean, default: false, index: true },
   },
-  { timestamps: { createdAt: true, updatedAt: true }, versionKey: false, collection: 'groups' }
+  { timestamps: false, versionKey: false, collection: 'groups' }
 );
 groupSchema.index({ 'members.id': 1, isDeleted: 1 });
 groupSchema.index({ createdAt: -1 });
 const Group = mongoose.model('Group', groupSchema);
+
+// ── 7. active_live_locations collection (State-Based Live Location for Personal & Group chats) ──
+const activeLiveLocationSchema = new mongoose.Schema(
+  {
+    chatId:     { type: String, required: true, index: true },
+    userId:     { type: String, required: true, index: true },
+    userName:   { type: String, default: '' },
+    avatarId:   { type: String, default: null },
+    photo:      { type: String, default: null },
+    latitude:   { type: Number, required: true },
+    longitude:  { type: Number, required: true },
+    isGroup:    { type: Boolean, default: false },
+    groupId:    { type: String, default: null },
+    groupName:  { type: String, default: '' },
+    receiverId: { type: String, default: null },
+    isActive:   { type: Boolean, default: true },
+    updatedAt:  { type: Date, default: getISTDate },
+    createdAt:  { type: Date, default: getISTDate },
+    istTime:    { type: String, default: getISTString },
+  },
+  { versionKey: false, collection: 'active_live_locations' }
+);
+activeLiveLocationSchema.index({ chatId: 1, userId: 1 }, { unique: true });
+activeLiveLocationSchema.index({ chatId: 1, isActive: 1 });
+activeLiveLocationSchema.index({ updatedAt: 1 }, { expireAfterSeconds: 86400 });
+const ActiveLiveLocation = mongoose.model('ActiveLiveLocation', activeLiveLocationSchema);
 
 function serializeGroup(g) {
   if (!g) return null;
@@ -419,6 +500,39 @@ async function saveIncomingPacket(payload) {
   // All group events: member join, group live location, rename, kick, left, system
   if (isGroup && isGroupNotificationPacket(text, payload.isNotification)) {
     const { type, data, groupId, groupName } = parseGroupNotification(text, chatId, payload);
+
+    // Live location tracking in ActiveLiveLocation
+    if (type === 'location' && data && data.userId && data.latitude != null && data.longitude != null) {
+      ActiveLiveLocation.findOneAndUpdate(
+        { chatId, userId: data.userId },
+        {
+          $set: {
+            chatId,
+            userId: data.userId,
+            userName: data.userName || senderName || '',
+            avatarId: data.avatarId || null,
+            photo: data.photo || null,
+            latitude: Number(data.latitude),
+            longitude: Number(data.longitude),
+            isGroup: true,
+            groupId: groupId || chatId.replace(/^group_/, ''),
+            groupName: groupName || '',
+            isActive: true,
+            updatedAt: getISTDate(),
+            istTime: getISTString(),
+          },
+          $setOnInsert: {
+            createdAt: getISTDate(),
+          },
+        },
+        { upsert: true, new: true }
+      ).catch((e) => console.warn('[location] Error upserting group live location:', e));
+    } else if (type === 'location_stopped' && (data?.userId || senderId)) {
+      const stopUid = data?.userId || senderId;
+      ActiveLiveLocation.deleteMany({ chatId, userId: stopUid })
+        .catch((e) => console.warn('[location] Error deleting group live location:', e));
+    }
+
     const doc = await GroupNotification.create({
       chatId,
       groupId: groupId || chatId.replace(/^group_/, ''),
@@ -430,6 +544,9 @@ async function saveIncomingPacket(payload) {
       text,
       data,
       clientMessageId: clientMessageId || null,
+      deliveredAt: getISTDate(),
+      createdAt: getISTDate(),
+      istTime: getISTString(),
     });
 
     // If a member was kicked, purge any old group invite messages for that user & group and remove from Group.members
@@ -507,6 +624,43 @@ async function saveIncomingPacket(payload) {
   // 1-on-1 notifications: live location share, live location stop, group invites / status in direct messages
   if (!isGroup && isPersonalNotificationPacket(text, payload.isNotification)) {
     const { type, data, groupId, groupName } = parseMassageNotification(text, chatId, payload);
+
+    // Live location tracking in ActiveLiveLocation
+    if (type === 'live_location' && data && (data.latitude != null || data.lat != null)) {
+      const lat = Number(data.latitude != null ? data.latitude : data.lat);
+      const lng = Number(data.longitude != null ? data.longitude : data.lng);
+      const uid = data.userId || senderId;
+      ActiveLiveLocation.findOneAndUpdate(
+        { chatId, userId: uid },
+        {
+          $set: {
+            chatId,
+            userId: uid,
+            userName: data.userName || senderName || '',
+            avatarId: data.avatarId || null,
+            photo: data.photo || null,
+            latitude: lat,
+            longitude: lng,
+            isGroup: false,
+            receiverId: receiverId || null,
+            isActive: true,
+            updatedAt: getISTDate(),
+            istTime: getISTString(),
+          },
+          $setOnInsert: {
+            createdAt: getISTDate(),
+          },
+        },
+        { upsert: true, new: true }
+      ).catch((e) => console.warn('[location] Error upserting personal live location:', e));
+    } else if (type === 'live_location_stopped') {
+      const stopUid = data?.userId || data?.senderId || senderId;
+      if (stopUid) {
+        ActiveLiveLocation.deleteMany({ chatId, userId: stopUid })
+          .catch((e) => console.warn('[location] Error deleting personal live location:', e));
+      }
+    }
+
     const doc = await MassageNotification.create({
       chatId,
       type,
@@ -518,7 +672,9 @@ async function saveIncomingPacket(payload) {
       text,
       data,
       clientMessageId: clientMessageId || null,
-      deliveredAt: new Date(),
+      deliveredAt: getISTDate(),
+      createdAt: getISTDate(),
+      istTime: getISTString(),
     });
 
     return { record: serializeRecord(doc), category: 'massage_notification' };
@@ -554,7 +710,9 @@ async function saveIncomingPacket(payload) {
       text,
       clientMessageId: clientMessageId || null,
       replyTo: replyTo || null,
-      deliveredAt: new Date(),
+      deliveredAt: getISTDate(),
+      createdAt: getISTDate(),
+      istTime: getISTString(),
     });
 
     // Update lastMessage and lastMessageTime on Group collection
@@ -563,7 +721,7 @@ async function saveIncomingPacket(payload) {
       : `${senderName || 'Member'}: ${text}`;
     Group.updateOne(
       { id: groupId },
-      { $set: { lastMessage: cleanPreview, lastMessageTime: new Date().toISOString() } }
+      { $set: { lastMessage: cleanPreview, lastMessageTime: getISTString() } }
     ).catch(() => {});
 
     return { record: serializeRecord(doc), category: 'group_message' };
@@ -579,7 +737,9 @@ async function saveIncomingPacket(payload) {
     text,
     clientMessageId: clientMessageId || null,
     replyTo: replyTo || null,
-    deliveredAt: new Date(),
+    deliveredAt: getISTDate(),
+    createdAt: getISTDate(),
+    istTime: getISTString(),
   });
   return { record: serializeRecord(doc), category: 'message' };
 }
@@ -603,7 +763,8 @@ async function editMessageInDb({ chatId, messageId, clientMessageId, newText, se
 
   doc.text = newText.trim();
   doc.isEdited = true;
-  doc.editedAt = new Date();
+  doc.editedAt = getISTDate();
+  doc.istTime = getISTString();
   await doc.save();
   return serializeRecord(doc);
 }
@@ -732,7 +893,7 @@ async function loadMessages(chatId, limit = 100, currentUserId = null) {
 
 async function markConversationRead(chatId, readerId, readAt) {
   if (!chatId || !readerId) return;
-  const ts = readAt || new Date();
+  const ts = readAt ? (readAt instanceof Date ? readAt : new Date(readAt)) : getISTDate();
   if (chatId.startsWith('group_')) {
     await GroupMessage.updateMany(
       { chatId, senderId: { $ne: readerId } },
@@ -851,6 +1012,113 @@ async function main() {
       }
     } catch (err) {
       res.status(500).json({ error: 'Failed to check push token' });
+    }
+  });
+
+  // ── REST: User profiles for leaderboard / avatars ─────────────────────────
+  app.get('/user-profiles', async (_req, res) => {
+    try {
+      const list = await UserProfile.find({ photo: { $ne: null } })
+        .select('userId photo avatar_id userName')
+        .lean();
+      const map = {};
+      list.forEach((u) => {
+        if (u.userId && u.photo) map[u.userId] = u.photo;
+      });
+      res.json({ ok: true, photos: map, profiles: list });
+    } catch (e) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  app.post('/user-profiles', async (req, res) => {
+    try {
+      const { userId, userName, photo, avatar_id } = req.body || {};
+      if (!userId) return res.status(400).json({ error: 'userId is required' });
+      const update = { updatedAt: getISTDate(), istTime: getISTString() };
+      if (photo) update.photo = photo;
+      if (userName) update.userName = userName;
+      if (avatar_id) update.avatar_id = avatar_id;
+      const doc = await UserProfile.findOneAndUpdate(
+        { userId },
+        { $set: update, $setOnInsert: { userId } },
+        { upsert: true, new: true }
+      );
+      res.json({ ok: true, profile: doc });
+    } catch (e) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  // ── REST: Live location state management (ActiveLiveLocation) ──────────────
+  app.get('/live-locations/:chatId', async (req, res) => {
+    try {
+      const chatId = String(req.params.chatId || '').trim();
+      if (!chatId) return res.status(400).json({ error: 'chatId is required' });
+      const threeHoursAgo = new Date(Date.now() - 3 * 60 * 60 * 1000 + IST_OFFSET_MS);
+
+      // Clean up expired ones in the background
+      ActiveLiveLocation.deleteMany({ chatId, updatedAt: { $lt: threeHoursAgo } }).catch(() => {});
+
+      const docs = await ActiveLiveLocation.find({
+        chatId,
+        isActive: true,
+        updatedAt: { $gte: threeHoursAgo },
+      }).lean();
+
+      res.json({ ok: true, locations: docs });
+    } catch (e) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  app.post('/live-locations/update', async (req, res) => {
+    try {
+      const { chatId, userId, userName, latitude, longitude, avatarId, photo, isGroup, groupId, groupName, receiverId } = req.body || {};
+      if (!chatId || !userId || latitude == null || longitude == null) {
+        return res.status(400).json({ error: 'chatId, userId, latitude, longitude are required' });
+      }
+      const doc = await ActiveLiveLocation.findOneAndUpdate(
+        { chatId, userId },
+        {
+          $set: {
+            chatId,
+            userId,
+            userName: userName || '',
+            avatarId: avatarId || null,
+            photo: photo || null,
+            latitude: Number(latitude),
+            longitude: Number(longitude),
+            isGroup: Boolean(isGroup || chatId.startsWith('group_')),
+            groupId: groupId || (chatId.startsWith('group_') ? chatId.replace(/^group_/, '') : null),
+            groupName: groupName || '',
+            receiverId: receiverId || null,
+            isActive: true,
+            updatedAt: getISTDate(),
+            istTime: getISTString(),
+          },
+          $setOnInsert: {
+            createdAt: getISTDate(),
+          },
+        },
+        { upsert: true, new: true }
+      ).lean();
+      res.json({ ok: true, location: doc });
+    } catch (e) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  app.post('/live-locations/stop', async (req, res) => {
+    try {
+      const { chatId, userId } = req.body || {};
+      if (!chatId || !userId) {
+        return res.status(400).json({ error: 'chatId and userId are required' });
+      }
+      await ActiveLiveLocation.deleteMany({ chatId, userId });
+      res.json({ ok: true, stopped: true });
+    } catch (e) {
+      res.status(500).json({ error: e.message });
     }
   });
 
@@ -1149,7 +1417,10 @@ async function main() {
         description: String(body.description || '').trim(),
         createdBy,
         createdByName: String(body.createdByName || '').trim(),
-        createdAt: body.createdAt || new Date().toISOString(),
+        createdAt: body.createdAt || getISTString(),
+        createdAtDate: getISTDate(),
+        updatedAtDate: getISTDate(),
+        istTime: getISTString(),
         icon: (body.icon || 'friends').toLowerCase(),
         isDeleted: false,
       };
@@ -1194,7 +1465,7 @@ async function main() {
         avatar_id: member.avatar_id ?? '1',
         photo: member.photo || null,
         role: member.role || 'member',
-        joinedAt: member.joinedAt || new Date().toISOString(),
+        joinedAt: member.joinedAt || getISTString(),
       };
 
       const hasMember = existing.members?.some(m => m.id === member.id);
@@ -1283,14 +1554,21 @@ async function main() {
       const notifDoc = new GroupNotification({
         chatId,
         groupId,
+        groupName: cleanName,
         type: 'name_updated',
+        senderId: userId || null,
+        senderName: userName || 'Admin',
+        receiverId: 'all',
+        text: `Group name updated to "${cleanName}"`,
         data: {
           groupId,
           groupName: cleanName,
           updatedBy: userId || 'unknown',
           updatedByName: userName || 'Admin',
         },
-        createdAt: new Date(),
+        deliveredAt: getISTDate(),
+        createdAt: getISTDate(),
+        istTime: getISTString(),
       });
       await notifDoc.save();
 
@@ -1791,14 +2069,21 @@ async function main() {
         const notifDoc = new GroupNotification({
           chatId,
           groupId,
+          groupName: cleanName,
           type: 'name_updated',
+          senderId: userId || null,
+          senderName: userName || 'Admin',
+          receiverId: 'all',
+          text: `Group name updated to "${cleanName}"`,
           data: {
             groupId,
             groupName: cleanName,
             updatedBy: userId || 'unknown',
             updatedByName: userName || 'Admin',
           },
-          createdAt: new Date(),
+          deliveredAt: getISTDate(),
+          createdAt: getISTDate(),
+          istTime: getISTString(),
         });
         await notifDoc.save();
 
