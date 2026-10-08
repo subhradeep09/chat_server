@@ -229,6 +229,55 @@ async function deletePushToken(userId) {
   await NotifyToken.deleteOne({ userId });
 }
 
+// ── 5. groups collection (Group Metadata & Membership) ──
+const groupMemberSubSchema = new mongoose.Schema(
+  {
+    id:        { type: String, required: true },
+    name:      { type: String, default: '' },
+    avatar_id: { type: mongoose.Schema.Types.Mixed, default: '1' },
+    photo:     { type: String, default: null },
+    role:      { type: String, enum: ['admin', 'member'], default: 'member' },
+    joinedAt:  { type: String, default: () => new Date().toISOString() },
+  },
+  { _id: false }
+);
+
+const groupSchema = new mongoose.Schema(
+  {
+    id:              { type: String, required: true, unique: true, index: true },
+    name:            { type: String, required: true, trim: true },
+    description:     { type: String, default: '' },
+    createdBy:       { type: String, required: true, index: true },
+    createdByName:   { type: String, default: '' },
+    createdAt:       { type: String, default: () => new Date().toISOString() },
+    members:         { type: [groupMemberSubSchema], default: [] },
+    icon:            { type: String, default: 'friends' },
+    lastMessage:     { type: String, default: 'Group created' },
+    lastMessageTime: { type: String, default: () => new Date().toISOString() },
+    isDeleted:       { type: Boolean, default: false, index: true },
+  },
+  { timestamps: { createdAt: true, updatedAt: true }, versionKey: false, collection: 'groups' }
+);
+groupSchema.index({ 'members.id': 1, isDeleted: 1 });
+groupSchema.index({ createdAt: -1 });
+const Group = mongoose.model('Group', groupSchema);
+
+function serializeGroup(g) {
+  if (!g) return null;
+  return {
+    id:              g.id,
+    name:            g.name,
+    description:     g.description || '',
+    createdBy:       g.createdBy,
+    createdByName:   g.createdByName || '',
+    createdAt:       g.createdAt || (g.createdAtDate ? g.createdAtDate.toISOString() : new Date().toISOString()),
+    members:         Array.isArray(g.members) ? g.members : [],
+    icon:            g.icon || 'friends',
+    lastMessage:     g.lastMessage || 'Group created',
+    lastMessageTime: g.lastMessageTime || g.createdAt || new Date().toISOString(),
+  };
+}
+
 // ── Helpers for packet classification & serialization ──
 
 function isGroupNotificationPacket(text, isNotificationFlag = false) {
@@ -383,11 +432,12 @@ async function saveIncomingPacket(payload) {
       clientMessageId: clientMessageId || null,
     });
 
-    // If a member was kicked, purge any old group invite messages for that user & group
+    // If a member was kicked, purge any old group invite messages for that user & group and remove from Group.members
     if (type === 'member_kicked') {
       const targetUserId = data?.targetUserId || data?.kickedUserId;
       const kickGroupId = groupId || data?.groupId;
       if (targetUserId && kickGroupId) {
+        Group.updateOne({ id: kickGroupId }, { $pull: { members: { id: targetUserId } } }).catch(() => {});
         try {
           const inviteRegex = new RegExp(`\\[GROUP_INVITE\\]:.*"groupId":"${kickGroupId}"`);
           await Promise.all([
@@ -413,6 +463,40 @@ async function saveIncomingPacket(payload) {
         } catch (e) {
           console.warn('[member_kicked] Failed to purge old invites:', e);
         }
+      }
+    }
+
+    if (type === 'member_left') {
+      const leftUserId = data?.userId || senderId;
+      const leftGroupId = groupId || data?.groupId;
+      if (leftGroupId && leftUserId) {
+        Group.updateOne({ id: leftGroupId }, { $pull: { members: { id: leftUserId } } }).catch(() => {});
+      }
+    }
+
+    if (type === 'member_sync') {
+      const syncMember = data?.member;
+      const syncGroupId = groupId || data?.groupId;
+      if (syncGroupId && syncMember?.id) {
+        Group.findOneAndUpdate(
+          { id: syncGroupId, 'members.id': syncMember.id },
+          { $set: { 'members.$': syncMember } }
+        ).then((found) => {
+          if (!found) {
+            return Group.updateOne(
+              { id: syncGroupId },
+              { $push: { members: syncMember } }
+            );
+          }
+        }).catch(() => {});
+      }
+    }
+
+    if (type === 'name_updated') {
+      const updatedName = data?.groupName || data?.newName;
+      const updateGid = groupId || data?.groupId;
+      if (updateGid && updatedName) {
+        Group.updateOne({ id: updateGid }, { $set: { name: updatedName } }).catch(() => {});
       }
     }
 
@@ -472,6 +556,16 @@ async function saveIncomingPacket(payload) {
       replyTo: replyTo || null,
       deliveredAt: new Date(),
     });
+
+    // Update lastMessage and lastMessageTime on Group collection
+    const cleanPreview = text.startsWith('[GROUP_SYSTEM]:')
+      ? text.replace('[GROUP_SYSTEM]:', '')
+      : `${senderName || 'Member'}: ${text}`;
+    Group.updateOne(
+      { id: groupId },
+      { $set: { lastMessage: cleanPreview, lastMessageTime: new Date().toISOString() } }
+    ).catch(() => {});
+
     return { record: serializeRecord(doc), category: 'group_message' };
   }
 
@@ -1000,6 +1094,172 @@ async function main() {
     }
   });
 
+  // ── REST: get groups for a user ───────────────────────────────────────────
+  app.get('/groups', async (req, res) => {
+    try {
+      const userId = String(req.query.userId || '').trim();
+      if (!userId) {
+        return res.status(400).json({ error: 'userId is required' });
+      }
+      const groups = await Group.find({
+        'members.id': userId,
+        isDeleted: { $ne: true },
+      })
+        .sort({ lastMessageTime: -1, createdAt: -1 })
+        .lean();
+
+      res.json(groups.map(serializeGroup));
+    } catch (err) {
+      console.error('GET /groups error:', err);
+      res.status(500).json({ error: 'Failed to fetch groups' });
+    }
+  });
+
+  // ── REST: get a single group by id ────────────────────────────────────────
+  app.get('/groups/:groupId', async (req, res) => {
+    try {
+      const groupId = String(req.params.groupId || '').trim();
+      if (!groupId) return res.status(400).json({ error: 'groupId is required' });
+
+      const group = await Group.findOne({ id: groupId, isDeleted: { $ne: true } }).lean();
+      if (!group) return res.status(404).json({ error: 'Group not found' });
+
+      res.json(serializeGroup(group));
+    } catch (err) {
+      console.error('GET /groups/:groupId error:', err);
+      res.status(500).json({ error: 'Failed to fetch group' });
+    }
+  });
+
+  // ── REST: create or upsert a group ────────────────────────────────────────
+  app.post('/groups', async (req, res) => {
+    try {
+      const body = req.body || {};
+      const groupId = String(body.id || '').trim();
+      const name = String(body.name || '').trim();
+      const createdBy = String(body.createdBy || '').trim();
+
+      if (!groupId || !name || !createdBy) {
+        return res.status(400).json({ error: 'id, name, and createdBy are required' });
+      }
+
+      const updateData = {
+        id: groupId,
+        name,
+        description: String(body.description || '').trim(),
+        createdBy,
+        createdByName: String(body.createdByName || '').trim(),
+        createdAt: body.createdAt || new Date().toISOString(),
+        icon: (body.icon || 'friends').toLowerCase(),
+        isDeleted: false,
+      };
+
+      if (Array.isArray(body.members) && body.members.length > 0) {
+        updateData.members = body.members;
+      }
+      if (body.lastMessage) updateData.lastMessage = body.lastMessage;
+      if (body.lastMessageTime) updateData.lastMessageTime = body.lastMessageTime;
+
+      const group = await Group.findOneAndUpdate(
+        { id: groupId },
+        { $set: updateData },
+        { upsert: true, new: true, setDefaultsOnInsert: true }
+      ).lean();
+
+      console.log(`[groups] Upserted group ${groupId} ("${name}") with ${group.members?.length || 0} members`);
+      res.json({ ok: true, group: serializeGroup(group) });
+    } catch (err) {
+      console.error('POST /groups error:', err);
+      res.status(500).json({ error: 'Failed to save group' });
+    }
+  });
+
+  // ── REST: add or update a member in a group ───────────────────────────────
+  app.post('/groups/:groupId/member', async (req, res) => {
+    try {
+      const groupId = String(req.params.groupId || '').trim();
+      const { member } = req.body || {};
+      if (!groupId || !member?.id) {
+        return res.status(400).json({ error: 'groupId and member with id are required' });
+      }
+
+      const existing = await Group.findOne({ id: groupId }).lean();
+      if (!existing) {
+        return res.status(404).json({ error: 'Group not found' });
+      }
+
+      const memberObj = {
+        id: member.id,
+        name: member.name || '',
+        avatar_id: member.avatar_id ?? '1',
+        photo: member.photo || null,
+        role: member.role || 'member',
+        joinedAt: member.joinedAt || new Date().toISOString(),
+      };
+
+      const hasMember = existing.members?.some(m => m.id === member.id);
+      let updated;
+      if (hasMember) {
+        updated = await Group.findOneAndUpdate(
+          { id: groupId, 'members.id': member.id },
+          { $set: { 'members.$': memberObj } },
+          { new: true }
+        ).lean();
+      } else {
+        updated = await Group.findOneAndUpdate(
+          { id: groupId },
+          { $push: { members: memberObj } },
+          { new: true }
+        ).lean();
+      }
+
+      res.json({ ok: true, group: serializeGroup(updated) });
+    } catch (err) {
+      console.error('POST /groups/:groupId/member error:', err);
+      res.status(500).json({ error: 'Failed to add member to group' });
+    }
+  });
+
+  // ── REST: remove member from group (leave or kick) ─────────────────────────
+  app.post('/groups/:groupId/remove-member', async (req, res) => {
+    try {
+      const groupId = String(req.params.groupId || '').trim();
+      const { userId } = req.body || {};
+      if (!groupId || !userId) {
+        return res.status(400).json({ error: 'groupId and userId are required' });
+      }
+
+      const updated = await Group.findOneAndUpdate(
+        { id: groupId },
+        { $pull: { members: { id: userId } } },
+        { new: true }
+      ).lean();
+
+      console.log(`[groups] Removed member ${userId} from group ${groupId}`);
+      res.json({ ok: true, group: updated ? serializeGroup(updated) : null });
+    } catch (err) {
+      console.error('POST /groups/:groupId/remove-member error:', err);
+      res.status(500).json({ error: 'Failed to remove member' });
+    }
+  });
+
+  // ── REST: delete group (soft-delete) ───────────────────────────────────────
+  app.delete('/groups/:groupId', async (req, res) => {
+    try {
+      const groupId = String(req.params.groupId || '').trim();
+      if (!groupId) return res.status(400).json({ error: 'groupId is required' });
+
+      await Group.updateOne({ id: groupId }, { $set: { isDeleted: true } });
+      io.to(`group_${groupId}`).emit('group:deleted', { groupId });
+
+      console.log(`[groups] Soft-deleted group ${groupId}`);
+      res.json({ ok: true, groupId });
+    } catch (err) {
+      console.error('DELETE /groups/:groupId error:', err);
+      res.status(500).json({ error: 'Failed to delete group' });
+    }
+  });
+
   // ── REST: rename a group ──────────────────────────────────────────────────
   app.post('/groups/rename', async (req, res) => {
     try {
@@ -1010,13 +1270,16 @@ async function main() {
       const cleanName = String(newName).trim();
       const chatId = `group_${groupId}`;
 
-      // 1. Update groupName in all messages for this group in group_massages
+      // 1. Update group document name in groups collection
+      await Group.updateOne({ id: groupId }, { $set: { name: cleanName } });
+
+      // 2. Update groupName in all messages for this group in group_massages
       await GroupMessage.updateMany(
         { $or: [{ groupId }, { chatId }] },
         { $set: { groupName: cleanName } }
       );
 
-      // 2. Save a record in group_notification
+      // 3. Save a record in group_notification
       const notifDoc = new GroupNotification({
         chatId,
         groupId,
@@ -1031,7 +1294,7 @@ async function main() {
       });
       await notifDoc.save();
 
-      // 3. Broadcast to socket room
+      // 4. Broadcast to socket room
       io.to(chatId).emit('group:updated', {
         groupId,
         groupName: cleanName,
@@ -1147,16 +1410,30 @@ async function main() {
     if (queryUserId) {
       setUserOnline(queryUserId, socket.id, queryChatId, null);
       console.log(`[connect] userId=${queryUserId} mode=${queryMode} chatId=${queryChatId || 'none'}`);
+      Group.find({ 'members.id': queryUserId, isDeleted: { $ne: true } })
+        .select('id')
+        .lean()
+        .then((userGroups) => {
+          userGroups.forEach((g) => socket.join(`group_${g.id}`));
+        })
+        .catch(() => {});
     }
 
     // ── user:register ──────────────────────────────────────────────────────────
     // Called by background socket (HomeScreen) to register for global notifications
-    socket.on('user:register', ({ userId } = {}) => {
+    socket.on('user:register', async ({ userId } = {}) => {
       if (!userId) return;
       const meta = socketMeta.get(socket.id) || {};
       socketMeta.set(socket.id, { ...meta, userId, mode: 'background' });
       setUserOnline(userId, socket.id, null, null);
       console.log(`[user:register] userId=${userId} background socket registered`);
+
+      try {
+        const userGroups = await Group.find({ 'members.id': userId, isDeleted: { $ne: true } })
+          .select('id')
+          .lean();
+        userGroups.forEach((g) => socket.join(`group_${g.id}`));
+      } catch (e) {}
     });
 
     // ── chat:join ─────────────────────────────────────────────────────────────
