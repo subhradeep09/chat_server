@@ -95,21 +95,25 @@ if (/atlas-sql|\.query\.mongodb\.net/i.test(MONGODB_URI)) {
 const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
 
 function getISTDate(date) {
-  const d = (date instanceof Date && !isNaN(date.getTime()))
-    ? date
-    : (typeof date === 'number' || (typeof date === 'string' && !isNaN(new Date(date).getTime()))
-        ? new Date(date)
-        : new Date());
-  return new Date(d.getTime() + IST_OFFSET_MS);
+  if (date instanceof Date && !isNaN(date.getTime())) {
+    return date;
+  }
+  if (typeof date === 'string' || typeof date === 'number') {
+    const parsed = new Date(date);
+    if (!isNaN(parsed.getTime())) return parsed;
+  }
+  return new Date(Date.now() + IST_OFFSET_MS);
 }
 
 function getISTString(date) {
-  const d = (date instanceof Date && !isNaN(date.getTime()))
-    ? date
-    : (typeof date === 'number' || (typeof date === 'string' && !isNaN(new Date(date).getTime()))
-        ? new Date(date)
-        : new Date());
-  const ist = new Date(d.getTime() + IST_OFFSET_MS);
+  if (typeof date === 'string') {
+    if (date.includes('+05:30')) return date;
+    if (date.endsWith('Z')) return date.replace('Z', '+05:30');
+  }
+  if (date instanceof Date && !isNaN(date.getTime())) {
+    return date.toISOString().replace('Z', '+05:30');
+  }
+  const ist = new Date(Date.now() + IST_OFFSET_MS);
   return ist.toISOString().replace('Z', '+05:30');
 }
 
@@ -266,20 +270,7 @@ async function deletePushToken(userId) {
   await NotifyToken.deleteOne({ userId });
 }
 
-// ── 5. user_profiles collection (User Google Photos & Avatars) ──
-const userProfileSchema = new mongoose.Schema(
-  {
-    userId:    { type: String, required: true, unique: true, index: true },
-    userName:  { type: String, default: '' },
-    photo:     { type: String, default: null },
-    avatar_id: { type: String, default: 'google' },
-    createdAt: { type: Date, default: getISTDate },
-    updatedAt: { type: Date, default: getISTDate },
-    istTime:   { type: String, default: getISTString },
-  },
-  { timestamps: false, versionKey: false, collection: 'user_profiles' }
-);
-const UserProfile = mongoose.model('UserProfile', userProfileSchema);
+
 
 // ── 6. groups collection (Group Metadata & Membership) ──
 const groupMemberSubSchema = new mongoose.Schema(
@@ -470,6 +461,8 @@ function parseMassageNotification(text, chatId, payload = {}) {
 }
 
 function serializeRecord(doc) {
+  const istTimeStr = doc.istTime || getISTString(doc.createdAt);
+  const deliveredStr = doc.deliveredAt ? getISTString(doc.deliveredAt) : istTimeStr;
   return {
     id:              String(doc._id),
     chatId:          doc.chatId,
@@ -484,11 +477,12 @@ function serializeRecord(doc) {
     clientMessageId: doc.clientMessageId || null,
     replyTo:         doc.replyTo || null,
     isEdited:        Boolean(doc.isEdited),
-    editedAt:        doc.editedAt || null,
+    editedAt:        doc.editedAt ? getISTString(doc.editedAt) : null,
     reactions:       Array.isArray(doc.reactions) ? doc.reactions : [],
-    createdAt:       doc.createdAt,
-    deliveredAt:     doc.deliveredAt || doc.createdAt,
-    readAt:          doc.readAt || null,
+    createdAt:       istTimeStr,
+    deliveredAt:     deliveredStr,
+    istTime:         istTimeStr,
+    readAt:          doc.readAt ? getISTString(doc.readAt) : null,
   };
 }
 
@@ -1015,40 +1009,7 @@ async function main() {
     }
   });
 
-  // ── REST: User profiles for leaderboard / avatars ─────────────────────────
-  app.get('/user-profiles', async (_req, res) => {
-    try {
-      const list = await UserProfile.find({ photo: { $ne: null } })
-        .select('userId photo avatar_id userName')
-        .lean();
-      const map = {};
-      list.forEach((u) => {
-        if (u.userId && u.photo) map[u.userId] = u.photo;
-      });
-      res.json({ ok: true, photos: map, profiles: list });
-    } catch (e) {
-      res.status(500).json({ error: e.message });
-    }
-  });
 
-  app.post('/user-profiles', async (req, res) => {
-    try {
-      const { userId, userName, photo, avatar_id } = req.body || {};
-      if (!userId) return res.status(400).json({ error: 'userId is required' });
-      const update = { updatedAt: getISTDate(), istTime: getISTString() };
-      if (photo) update.photo = photo;
-      if (userName) update.userName = userName;
-      if (avatar_id) update.avatar_id = avatar_id;
-      const doc = await UserProfile.findOneAndUpdate(
-        { userId },
-        { $set: update, $setOnInsert: { userId } },
-        { upsert: true, new: true }
-      );
-      res.json({ ok: true, profile: doc });
-    } catch (e) {
-      res.status(500).json({ error: e.message });
-    }
-  });
 
   // ── REST: Live location state management (ActiveLiveLocation) ──────────────
   app.get('/live-locations/:chatId', async (req, res) => {
